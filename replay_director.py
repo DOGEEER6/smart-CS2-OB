@@ -216,6 +216,29 @@ DEFAULTS = {
     #   两枪全裁掉（用户 2026-10-06 指出）。0 = 关掉，回到"只按最后一枪"。
     "entry_streak_gap_seconds": 5.0,
 
+    # --- ★ 包装转场（stinger）不许吃掉回放片头 ---
+    # 你的 OBS 当前转场是「转场」= obs_stinger_transition，素材
+    #   J:/比赛包装/01_Logo_transition_long.mov
+    # 实测总长 **3.35 秒**（纯读文件头解析 mvhd 得来，不用装任何库）。
+    # 切到回放场景的那一刻，stinger 就一直盖在节目画面上（1.0s 才真正切场景，
+    # 3.35s 才放完），所以回放的**前 3.35 秒观众根本看不到** ——
+    # 用户 2026-10-06 反馈："转场会覆盖掉前面一部分"。
+    # 现在的做法：切场景后立刻把回放定格在第一帧，等这 3.35 秒包装放完再开播，
+    # 片头一帧不丢（切场景→暂停的 RPC 大约 10~30ms，最多差 1~2 帧）。
+    #   null  = 自动（读 OBS 当前转场；不是 stinger 就完全不等待）
+    #   数字  = 强制等这么多秒（0 = 不等，回到旧行为）
+    "replay_wrap_seconds": None,
+    "wrap_pause_max_ms": 250,         # 暂停调用超过这么多 ms 就打警告（片头可能跑掉一点）
+
+    # --- ★ 小键盘右键：保留本场回放片段（把素材另存成视频文件）---
+    # 按一下 = 让 Replay Source 把"当前那段素材"写成一个文件，事后能剪出去发。
+    # 存出来的是**入点之后**的内容（插件 replay_save() 会照旧应用 trim_front），
+    # 和你在回放里看到的一致；没有定稿过素材时按下什么都不会发生（插件自己会拦）。
+    #   save_dir 留空 = 存到 OBS 的录制目录（GetRecordDirectory，你现在是 E:/Paris2024）
+    "save_replay_key": True,
+    "save_dir": "",
+    "save_file_format": "回放_%CCYY-%MM-%DD_%hh.%mm.%ss",
+
     # --- 和 Astra 的协作（重要）---
     # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
     #   require_live_scene : 只有当直播场景正好是 live_scene 时才插回放。
@@ -867,6 +890,17 @@ class NullObsClient:
         self.calls.append((req_type, data))
         if req_type == "GetSourceActive":
             return {"videoShowing": True, "videoActive": True}
+        if req_type == "GetCurrentSceneTransition":
+            # 仿真里当"没有转场要等"处理：transitionDuration=0 → 包装等待 0 秒，
+            # 于是仿真时序和以前逐项一致（真机上这个值来自 stinger 素材时长）。
+            return {"transitionKind": "obs_stinger_transition",
+                    "transitionFixed": True,
+                    "transitionDuration": 0,
+                    "transitionSettings": {"path": "C:/Temp/sim_stinger.mov"}}
+        if req_type == "GetRecordDirectory":
+            return {"recordDirectory": "C:/Temp/sim_records"}
+        if req_type == "GetInputSettings":
+            return self.input_settings((data or {}).get("inputName") or "")[1]
         if req_type == "TriggerHotkeyByName":
             log(f"    [OBS] 触发热键 {data.get('hotkeyName')} @ {data.get('contextName')}")
         return {}
@@ -933,6 +967,10 @@ class ReplayDirector:
         self._locked_at = 0.0
         # 进回放之前人在哪个场景（回放结束后切回这里，而不是死板地切回 live_scene）
         self._scene_before_replay = None
+        # ★ 包装转场（stinger）等待：切场景后先把回放定格在第一帧，等包装放完再开播，
+        #   不然回放的前 ~3.35 秒会被包装画面盖掉（用户 2026-10-06 反馈）。
+        self._wrap_resume_at = 0.0       # >0 = 正在等包装放完（到点由 ticker 恢复播放）
+        self._wrap_cache = None          # 自动量出来的包装时长（只量一次）
         self.expected_hold = 0.0
         self.manual_replay_pending = False
         self._expected_scene = None      # 兼容旧逻辑
@@ -1010,6 +1048,51 @@ class ReplayDirector:
                     f"capture_seconds={cfg['capture_seconds']} / speed={cfg['speed']} 一致）")
         except Exception as e:
             log(f"⚠️  读回放源设置失败（不影响运行）: {e}")
+
+        # ★ 包装转场（stinger）会盖住回放片头：启动时报一次它有多长（只报一次）。
+        _ = self._wrap_seconds()
+
+        # ★ 小键盘右键 = 保留片段：把"存到哪儿 / 文件名格式"写进插件。
+        #   插件源码 :3070 `obs_properties_add_path(... OBS_PATH_DIRECTORY ...)` 的
+        #   directory 默认是**未设置**的 → 直接按保存会生成相对路径，很可能落到
+        #   OBS 工作目录里去，所以必须显式给一个目录。
+        if cfg.get("save_replay_key", True):
+            try:
+                want_dir = str(cfg.get("save_dir") or "").strip()
+                src = "config.save_dir"
+                if not want_dir:
+                    try:
+                        want_dir = str((self.obs.request("GetRecordDirectory")
+                                        or {}).get("recordDirectory") or "")
+                        src = "OBS 录制目录"
+                    except Exception as e:
+                        log(f"   （读 OBS 录制目录失败: {e}）")
+                if want_dir and cfg.get("save_dir"):
+                    try:
+                        os.makedirs(want_dir, exist_ok=True)   # 只有你明确指定才建目录
+                    except Exception as e:
+                        log(f"   ⚠️ 建目录「{want_dir}」失败: {e}")
+                want_fmt = str(cfg.get("save_file_format")
+                               or "回放_%CCYY-%MM-%DD_%hh.%mm.%ss")
+                _, s3 = self.obs.input_settings(cfg["replay_item"])
+                patch = {}
+                if int(s3.get("lossless") or 0):
+                    # 无损模式导出的是 .avi，体积是 H.264 的几十倍，默认关掉
+                    patch["lossless"] = False
+                if want_dir and str(s3.get("directory") or "") != want_dir:
+                    patch["directory"] = want_dir
+                if str(s3.get("file_format") or "") != want_fmt:
+                    patch["file_format"] = want_fmt
+                if patch:
+                    self.obs.request("SetInputSettings",
+                                     {"inputName": cfg["replay_item"],
+                                      "inputSettings": patch, "overwrite": False})
+                    log(f"   『小键盘右键=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}"
+                        f"（来自{src}），文件名 {want_fmt}")
+                else:
+                    log(f"   『小键盘右键=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}")
+            except Exception as e:
+                log(f"   （设置保留片段失败，右键仍可用但可能存到默认位置: {e}）")
 
         self.expected_hold = min(
             float(cfg.get("record_max_seconds", 10.0)) / max(cfg["speed"], 0.05)
@@ -1427,9 +1510,11 @@ class ReplayDirector:
             self.replay_active = True
             self._started_at = time.time()
             self._phase_at_start = self.state_ref.phase if self.state_ref else None
+            # ★ 包装转场（stinger）会盖住回放的片头 —— 这段时间播放窗口也要往后推。
+            wrap = self._wrap_seconds()
             # 播放窗口 += 5 秒安全垫：正常情况下插件会在片子结束那一帧就切回去，
             # 这个是"插件没生效"时的兜底。
-            self.replay_until = time.time() + hold + 5.0
+            self.replay_until = time.time() + wrap + hold + 5.0
             self.replay_hard_deadline = self.replay_until + 10.0
             self.last_replay_round = round_no if round_no is not None else self.last_replay_round
             self.counters["replays"] += 1
@@ -1470,6 +1555,27 @@ class ReplayDirector:
             self.obs.set_item_enabled(self.cfg["replay_scene"], self.replay_item_id, True)
             for name, iid in self.overlay_item_ids:
                 self.obs.set_item_enabled(self.cfg["replay_scene"], iid, True)
+            # ★ 立刻把回放定格在第一帧，等包装转场放完再开播（片头一帧不丢）。
+            #   插件行为（replay-source.c:1373）：`restart` 处理时
+            #   `pause_timestamp = c->play ? 0 : os_timestamp` —— 所以"显示后马上暂停"
+            #   通常正好停在片段第一帧；就算晚了几十毫秒，也只差 1~2 帧。
+            #   暂停是**切换式**的（:722-757），这里必须是 RESTART/播放中的状态才安全，
+            #   而 set_item_enabled(True) 触发 visibility_action=Restart 正是这个状态。
+            self._wrap_resume_at = 0.0
+            if wrap > 0.05:
+                t0 = time.time()
+                try:
+                    self._hk("ReplaySource.Pause")
+                    used_ms = (time.time() - t0) * 1000.0
+                    self._wrap_resume_at = time.time() + wrap
+                    log(f"   🎁 包装转场 {wrap:.2f} 秒：回放先定格在第一帧"
+                        f"（暂停耗时 {used_ms:.0f}ms），{wrap:.2f} 秒后自动开播")
+                    lim = float(self.cfg.get("wrap_pause_max_ms", 250) or 250)
+                    if used_ms > lim:
+                        log(f"      ⚠️ 暂停调用用了 {used_ms:.0f}ms（>{lim:.0f}ms），"
+                            f"片头可能已经跑掉约 {used_ms/1000:.2f} 秒")
+                except Exception as e:
+                    log(f"   ⚠️ 定格第一帧失败（片头可能被转场盖住）: {e}")
         except Exception:
             log("!! 启动回放失败:\n" + traceback.format_exc())
             self._end_replay("启动失败")
@@ -1479,6 +1585,112 @@ class ReplayDirector:
         """触发 Replay Source 的源级热键（必须带 contextName）。"""
         self.obs.request("TriggerHotkeyByName",
                          {"hotkeyName": name, "contextName": self.cfg["replay_item"]})
+
+    # ------------------------------------------------------------------
+    def _detect_wrap(self):
+        """问 OBS 当前转场：是 stinger 就量出它的时长（= 会盖住回放片头多久）。
+
+        实测（本机 OBS 32.2.2）：
+          * `GetCurrentSceneTransition` 返回
+            {transitionName:"转场", transitionKind:"obs_stinger_transition",
+             transitionFixed:true, transitionDuration:null,
+             transitionSettings:{path:"J:/比赛包装/01_Logo_transition_long.mov",
+                                 transition_point:1000, preload:true}}
+          * stinger 的时长 API **问不出来**（transitionFixed=true → Duration 是 null），
+            所以直接读那个 .mov 的文件头量（见 mov_duration）。
+          * 普通转场（淡入淡出/剪切）不需要等待 —— 它们不会挡住进来的画面。
+        """
+        try:
+            d = self.obs.request("GetCurrentSceneTransition") or {}
+        except Exception as e:
+            logv(self.cfg, f"   （读当前转场失败，不做包装等待: {e}）")
+            return 0.0
+        kind = str(d.get("transitionKind") or "")
+        name = str(d.get("transitionName") or "")
+        if "stinger" not in kind.lower():
+            log(f"   当前转场「{name}」不是 stinger 包装转场 → 回放不需要等转场")
+            return 0.0
+        st = d.get("transitionSettings") or {}
+        path = str(st.get("path") or "")
+        dur = mov_duration(path) if path else None
+        if dur:
+            log(f"   当前转场「{name}」是 stinger，素材 {os.path.basename(path)} "
+                f"实测 {dur:.2f} 秒 → 回放片头会等它放完才开播")
+            return dur
+        # 量不出来时退一步：有些导出会把时长塞进 transitionDuration
+        ms = None
+        try:
+            ms = d.get("transitionDuration")
+        except Exception:
+            ms = None
+        if ms:
+            log(f"   当前转场「{name}」是 stinger，量不出素材时长，"
+                f"按 OBS 报的 {float(ms)/1000:.2f} 秒等")
+            return float(ms) / 1000.0
+        if ms == 0 or not path:
+            # 仿真 / 还没配 stinger 素材：OBS 说时长是 0，那就没什么可等的
+            logv(self.cfg, f"   当前转场「{name}」是 stinger，但时长报 0 → 不做等待")
+            return 0.0
+        log(f"   ⚠️ 当前转场「{name}」是 stinger，但量不出素材时长"
+            f"（path={path}）→ 不做等待；要手动指定就设 replay_wrap_seconds")
+        return 0.0
+
+    def _wrap_seconds(self):
+        """这次回放要等多久才开播（0 = 立刻播，和以前一样）。"""
+        v = self.cfg.get("replay_wrap_seconds")
+        if v is not None:
+            try:
+                return max(0.0, float(v))
+            except Exception:
+                return 0.0
+        if self._wrap_cache is None:
+            self._wrap_cache = self._detect_wrap()
+        return self._wrap_cache
+
+    # ------------------------------------------------------------------
+    def save_replay(self):
+        """小键盘右键：把当前那段素材另存成一个视频文件。
+
+        插件源码依据（obs-replay-source 1.8.1 `replay-source.c`）：
+          * 热键 `ReplaySource.Save`（:1249-1260）只把 saving_status 置为 STARTING，
+            真正写盘在渲染线程的 `replay_save()`（:914-1056）里做。
+          * `:916-919` 有个守卫：`video_frame_count == 0` 就直接返回 ——
+            **还没定稿过素材时按一下什么都不会发生**（安全，不会崩，也不会留半个文件）。
+          * `:925` 存的是 `current_replay`（也就是你按 Enter 会播的那一段），
+            `:1024-1034` 会照旧应用 trim_front → 存出来的和回放里看到的一样。
+          * `:1010` 会往 OBS 日志写 `[replay_source: 'Replay Source'] start saving '<文件>'`，
+            所以这里用"字节偏移读日志新行"的办法把完整路径回显给你。
+        """
+        try:
+            mark = obs_log_mark()
+            self._hk("ReplaySource.Save")
+        except Exception as e:
+            log(f"❌ 【小键盘 → 保留片段】失败: {e}")
+            return
+        log("💾 【小键盘 → 保留片段】已让 OBS 把这段素材写成文件")
+        if not self._snapshot_ok:
+            log("   ℹ️ 这次会话还没定格过素材。缓冲是插件自己在持续累积的，"
+                "所以通常照样能存（实测：没定格过也能存出 8.5MB 的片段）——")
+            log("      下面没出现「✔ 已开始写盘」才是真没素材。")
+        threading.Thread(target=self._report_save, args=(mark,), daemon=True).start()
+
+    def _report_save(self, mark):
+        """等 OBS 日志里出现 `start saving '<文件>'`，把完整路径打出来。"""
+        for _ in range(40):          # 最多等 ~12 秒
+            time.sleep(0.3)
+            for l in obs_log_since(mark, limit=200):
+                m = re.search(r"start saving '([^']+)'", l)
+                if m:
+                    path = m.group(1)
+                    n = self.last_clip_seconds
+                    log(f"   ✔ 已开始写盘：{path}")
+                    if n:
+                        log(f"     （这段约 {n:.1f} 秒，写完要等同样长的时间，"
+                            f"期间别关 OBS）")
+                    return
+        log("   ⚠️ 没在 OBS 日志里看到 'start saving' —— 这一按没有可存的素材。")
+        log("      缓冲是插件自己在累积的，只有 OBS 刚启动 / 刚 Enable 过缓冲时才会是空的：")
+        log("      先按一下 → 抓一次（定格），再按小键盘 6 保留。")
 
     # ------------------------------------------------------------------
     def _entry_skip(self, round_no=None):
@@ -1695,6 +1907,8 @@ class ReplayDirector:
         if not self.replay_active:
             return
         self.replay_active = False
+        # 还在等包装转场就取消掉 —— 别让"待恢复播放"在切回直播后又把回放放起来
+        self._wrap_resume_at = 0.0
         log(f"⏹  结束回放（{why}）")
         # ★ 顺序很重要：**先切场景，再隐藏源**。
         #   反过来的话，源先消失、画面会闪一下空帧，看起来就是"卡顿"。
@@ -1729,6 +1943,8 @@ class ReplayDirector:
                     self._fire_pending_snapshot()
                 except Exception:
                     log("!! 快照出错:\n" + traceback.format_exc())
+            # ★ 包装转场放完了 → 让回放真正开始播（见 _start_replay 里的定格第一帧）
+            self._resume_after_wrap()
             if self.replay_active and time.time() >= self.replay_until:
                 self._end_replay("播放完成")
             elif self.replay_active and time.time() >= self.replay_hard_deadline:
@@ -1741,6 +1957,24 @@ class ReplayDirector:
             #   是你手动按一下方向键**。结果整场后面每个回合都被跳过定格，按 Enter
             #   只能反复播很早以前那一段素材。现在到点自动交还。
             self._expire_manual_lock()
+
+    def _resume_after_wrap(self):
+        """包装转场放完了 → 让回放真正开始播。
+
+        和 `_start_replay` 里的"定格第一帧"配对：那边显示回放源后立刻 Pause，
+        这里等 stinger 放完再 Replay（插件是**切换式**暂停，Replay 就是从暂停处继续，
+        不会跳过片段）。单独拆成方法是为了能脱离 ticker 死循环做单测。
+        """
+        if not (self.replay_active and self._wrap_resume_at
+                and time.time() >= self._wrap_resume_at):
+            return False
+        self._wrap_resume_at = 0.0
+        try:
+            self._hk("ReplaySource.Replay")
+            log("   ▶️ 包装转场放完，回放开始播")
+        except Exception:
+            log("!! 恢复回放播放失败:\n" + traceback.format_exc())
+        return True
 
     def _expire_manual_lock(self):
         """人工接管的锁到点自动交还（manual_lock_seconds 秒；0 = 永不过期）。"""
@@ -1806,6 +2040,7 @@ LLKHF_EXTENDED = 0x01
 VK_LEFT = 0x25
 VK_RIGHT = 0x27
 VK_RETURN = 0x0D
+VK_NUMPAD6 = 0x66          # 小键盘 6 / 小键盘右方向键（NumLock 关时变成 (VK_RIGHT, ext=True)）
 
 
 class _KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -1941,10 +2176,11 @@ class KeyHook:
 
 class ManualController:
     """
-    导播手动的三段式即时回放：
+    导播手动的四段式即时回放：
 
         ←  开始录制   清空缓冲，从此刻开始累积素材（Disable → Enable）
         →  结束录制   把这一段定稿成一段可播放的回放（Load replay）
+        小键盘6        保留片段：把当前这段素材另存成文件（.flv，赛后能剪出去发）
         小键盘Enter   切到「即时回放」场景播放；再按一次立刻切回直播
 
     为什么 ← 要先 Disable 再 Enable：
@@ -2055,22 +2291,51 @@ class ManualController:
         log("▶  【小键盘 Enter】切画面播放")
         d._start_replay("手动播放", None, reuse_snapshot=True)
 
+    # ---------------- 小键盘右键：保留片段 ----------------
+    def on_save(self):
+        """把当前那段素材另存成文件（赛后能剪出去发）。"""
+        self.d.save_replay()
+
+
+def numlock_on():
+    """NumLock 灯亮着吗？
+
+    ★ 为什么要在意：小键盘 6 在 **NumLock 关**的时候，Windows 发出的就是
+      "右方向键 + 扩展位"，和键盘右边那个 → 完全一样（钩子层面区分不开，
+      scancode 都是 0x4D）—— 于是"小键盘右键=保留片段"会被当成"→ 抓取"。
+      NumLock 亮着时它是 VK_NUMPAD6(0x66)，两者就能各干各的。
+    """
+    try:
+        _setup_win_prototypes()
+        return bool(ctypes.windll.user32.GetKeyState(0x90) & 1)   # 0x90 = VK_NUMLOCK
+    except Exception:
+        return None
+
 
 def make_manual_hook(controller, debounce=0.5):
     """
     键位是分开绑定的，按模式走：
 
-      事后抓取(rétrospective，默认)  →  只用一个键：
+      事后抓取(rétrospective，默认)  →  两个键：
           →  抓取最近 N 秒（抓到后可选自动播）
+          小键盘 6  保留片段（把当前这段素材另存成文件，赛后能剪出去发）
           小键盘 Enter  切画面播放 / 再按一次切回
 
-      精确框选(bracket)  →  三个键：
-          ←  开始录制    →  结束录制    小键盘 Enter  播放
+      精确框选(bracket)  →  四个键：
+          ←  开始录制    →  结束录制
+          小键盘 6  保留片段    小键盘 Enter  播放
 
     两种模式下 ← 都绑上，但事后抓取模式里按它只会打印一句提示，不做任何事。
+
+    ★ 为什么"小键盘 6"没有连 `(VK_RIGHT, True)` 一起绑：
+      方向键在 Windows 里**本身就带扩展位**（E0 前缀），NumLock 关掉时小键盘 6
+      发出来的也是 `(VK_RIGHT, ext=True)`、scancode 同样是 0x4D —— 两者在底层
+      完全同码，钩子上区分不开。所以这里只认 NumLock 亮着时的 `VK_NUMPAD6`，
+      免得把真正的 → 键劫持成"保留片段"（→ 是抓取键）。NumLock 没开时启动会提醒。
     """
     return KeyHook({VK_LEFT: controller.on_record_start,
                     VK_RIGHT: controller.on_record_stop,
+                    VK_NUMPAD6: controller.on_save,
                     (VK_RETURN, True): controller.on_play},
                    debounce=debounce)
 
@@ -2284,6 +2549,59 @@ def obs_log_since(mark, limit=50):
         return [l for l in data.splitlines() if "replay_source" in l][:limit]
     except Exception:
         return []
+
+
+def mov_duration(path, probe_bytes=2 * 1024 * 1024):
+    """只读文件头，解析 QuickTime/MP4 里 `mvhd` 的时长，返回秒（失败返回 None）。
+
+    为什么需要：OBS 的 stinger 转场用 `transitionFixed=true` + `transitionDuration=null`
+    上报 —— obs-websocket **问不出**这种固定转场的时长（实测 GetSceneTransitionOverride
+    这个请求类型根本不存在）。但"包装转场有多长"直接决定"回放片头会被盖住多久"，
+    所以只能自己量。纯标准库：读前 2MB（必要再读尾部 4MB）找 `mvhd` 原子。
+
+    mvhd 布局（解析出来的偏移都是相对 'mvhd' 那 4 个字节的）：
+        version(1) flags(3) creation(4) modification(4) timescale(4) duration(4)   ← version 0
+        version(1) flags(3) creation(8) modification(8) timescale(4) duration(8)  ← version 1
+    本机实测 J:/比赛包装/01_Logo_transition_long.mov（1,008,947,306 字节）→ 3.35 秒。
+    """
+    def _parse(buf, base):
+        i = buf.find(b"mvhd")
+        if i < 0:
+            return None
+        p = i + 4
+        if p + 20 > len(buf):
+            return None
+        ver = buf[p]
+        try:
+            if ver == 1:
+                if p + 32 > len(buf):
+                    return None
+                timescale = int.from_bytes(buf[p + 20:p + 24], "big")
+                duration = int.from_bytes(buf[p + 24:p + 32], "big")
+            else:
+                timescale = int.from_bytes(buf[p + 12:p + 16], "big")
+                duration = int.from_bytes(buf[p + 16:p + 20], "big")
+        except Exception:
+            return None
+        if timescale > 0 and duration > 0:
+            return duration / float(timescale)
+        return None
+
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(probe_bytes)
+        d = _parse(head, 0)
+        if d:
+            return d
+        # moov 可能压在文件尾（某些导出工具会这样）
+        if size > probe_bytes:
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 4 * 1024 * 1024))
+                d = _parse(f.read(), size)
+        return d
+    except Exception:
+        return None
 
 
 def lan_ips():
@@ -3589,10 +3907,19 @@ def run_test_load_replay(cfg):
 
 def run_test_keys(cfg):
     log("=== 热键测试 ===")
-    log("请依次按这三个键，窗口里会实时打印。按 Ctrl+C 结束。")
+    log("请依次按这四个键，窗口里会实时打印。按 Ctrl+C 结束。")
     log("   ←  左方向键")
     log("   →  右方向键")
+    log("   小键盘 6（保留片段）")
     log("   小键盘 Enter（不是主键盘那个大的 Enter）")
+    nl = numlock_on()
+    if nl is None:
+        log("   （读不到 NumLock 状态）")
+    elif nl:
+        log("   NumLock：✅ 亮着 —— 小键盘 6 和 → 是两个不同的键，互不干扰")
+    else:
+        log("   NumLock：❌ 关着 —— 现在小键盘 6 和 → 发的是同一个按键，"
+            "两个都会走「→ 抓取」。请按一下 NumLock 让灯亮起来再测。")
 
     def mk(label, is_target):
         def f():
@@ -3603,6 +3930,7 @@ def run_test_keys(cfg):
     hook = KeyHook({
         VK_LEFT: mk("← 左方向键", True),
         VK_RIGHT: mk("→ 右方向键", True),
+        VK_NUMPAD6: mk("小键盘 6 / 保留片段", True),
         (VK_RETURN, True): mk("小键盘 Enter", True),
         VK_RETURN: mk("主键盘 Enter", False),
     }, debounce=0.25)
@@ -3936,6 +4264,14 @@ def run_live(cfg, manual_only=False):
                 log("      ←  左方向键      此模式下未启用（想精确框选请把 config.json 的")
                 log("                       record_mode 改成 \"bracket\"）")
             log("      小键盘 Enter     切到「即时回放」播放；再按一次立刻切回")
+            if cfg.get("save_replay_key", True):
+                log("      小键盘 6         保留片段（把当前这段素材另存成文件）"
+                    f" → {cfg.get('save_dir') or 'OBS 录制目录'}")
+            nl = numlock_on()
+            if nl is False:
+                log("      ⚠️ NumLock 灯是灭的：小键盘 6 和 → 发的是同一个按键，"
+                    "现在按小键盘 6 只会当抓取。")
+                log("         想让「保留片段」生效，请按一下 NumLock 让灯亮起来。")
         else:
             log(f"⚠️  全局热键安装失败：{hook.error}")
             log("    可以用浏览器控制端点代替：/control/record_start /record_stop /replay")
