@@ -48,9 +48,12 @@ import math
 import os
 import queue
 import re
+import shutil
 import socket
 import socketserver
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -1023,6 +1026,13 @@ class ReplayDirector:
 
         # ★ 包装转场（stinger）会盖住回放片头：启动时报一次它有多长（只报一次）。
         _ = self._wrap_seconds()
+        if self.cfg.get("replay_wrap_seconds") is not None:
+            try:
+                log(f"   （包装等待按配置写死 {float(self.cfg['replay_wrap_seconds']):.2f} 秒，"
+                    f"不再自己量素材；想让它自己量就把 config.json 里的 "
+                    f"replay_wrap_seconds 设成 null）")
+            except Exception:
+                pass
 
         # ★ 2026-10-06：转场放完怎么"续播"——必须走媒体接口，不能按 ReplaySource.Replay
         #   （那是插件的 Load replay，会重新取一段素材，播出来不是用户框的那段）。
@@ -1529,7 +1539,14 @@ class ReplayDirector:
         path = str(st.get("path") or "")
         dur = mov_duration(path) if path else None
         if dur:
-            log(f"   当前转场「{name}」是 stinger，素材 {os.path.basename(path)} "
+            base = os.path.basename(path)
+            vis = stinger_visible_seconds(path, dur, st.get("transition_point"))
+            if vis is not None and vis < dur - 0.08:
+                log(f"   当前转场「{name}」是 stinger，素材 {base} 时长 {dur:.2f} 秒，"
+                    f"但动画在 {vis:.2f} 秒就放完了（最后 {dur - vis:.2f} 秒是全透明帧，"
+                    f"那段时间观众看到的就是定格的回放）→ 回放只等 {vis:.2f} 秒就开播")
+                return float(vis)
+            log(f"   当前转场「{name}」是 stinger，素材 {base} "
                 f"实测 {dur:.2f} 秒 → 回放片头会等它放完才开播")
             return dur
         # 量不出来时退一步：有些导出会把时长塞进 transitionDuration
@@ -2478,6 +2495,70 @@ def mov_duration(path, probe_bytes=2 * 1024 * 1024):
         return d
     except Exception:
         return None
+
+
+def stinger_visible_seconds(path, duration, transition_point_ms=None,
+                            ffmpeg_exe=None, transparent_mean=8.0, timeout=30.0):
+    """量出包装素材"动画真正放完"的时刻（秒）—— 回放等到这时候开播，一帧片头都不丢。
+
+    为什么不直接用文件时长（2026-10-06 用户反馈："播放前会卡零点几秒不动"）：
+    实测 `J:/比赛包装/01_Logo_transition_long.mov` 时长 3.35 秒，但**最后 0.40 秒
+    是全透明的黑帧**（8x8 采样下 alpha=6/255、luma=0）。OBS 的 stinger 转场在
+    `transition_point`(1000ms) 那一刻就已经把节目切到新场景，之后观众看到的是
+    "盖在包装动画下面的回放画面" —— 动画 2.95 秒就放完了，却要等到 3.35 秒才开播，
+    中间那 0.4 秒画面一动不动，看起来就是"卡了一下"。
+
+    做法：用 ffmpeg 把 alpha 通道抽成 8x8 灰度序列（201 帧才 12 KB），从尾巴往前
+    跳过"整帧透明"的帧，最后一张"还看得见"的帧就是动画结束点。
+      * 量不出来（没装 ffmpeg / 解码失败 / 帧数不对）→ 返回 `duration`（和以前一样等满）。
+      * **只会提前，不会推后**；下限是 `transition_point`（那之前节目还在旧场景上，
+        播了观众也看不见）。
+      * 整段都是透明帧 → 返回 0.0（等于没有包装，不用等）。
+    """
+    try:
+        if not path or not duration or float(duration) <= 0:
+            return duration
+        dur = float(duration)
+        exe = ffmpeg_exe if ffmpeg_exe is not None else shutil.which("ffmpeg")
+        if not exe or not os.path.isfile(exe) or not os.path.isfile(path):
+            return dur
+        fd, tmp = tempfile.mkstemp(suffix=".raw", prefix="sting_alpha_")
+        os.close(fd)
+        try:
+            cmd = [exe, "-v", "error", "-y", "-i", path,
+                   "-vf", "alphaextract,scale=8:8:flags=area",
+                   "-pix_fmt", "gray", "-f", "rawvideo", tmp]
+            p = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=timeout)
+            if p.returncode != 0:
+                return dur
+            with open(tmp, "rb") as f:
+                raw = f.read()
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        per = 64                       # 8 x 8
+        n = len(raw) // per
+        if n < 4:
+            return dur
+        fps = n / dur                  # 帧数 / 文件时长 = 素材帧率，不用再问 ffprobe
+        i = n - 1
+        while i >= 0 and sum(raw[i * per:(i + 1) * per]) / float(per) <= transparent_mean:
+            i -= 1
+        if i < 0:
+            return 0.0
+        visible = (i + 1) / fps        # 这一帧的结束时刻
+        floor = 0.0
+        try:
+            if transition_point_ms:
+                floor = max(0.0, float(transition_point_ms) / 1000.0)
+        except Exception:
+            floor = 0.0
+        return max(floor, min(dur, visible))
+    except Exception:
+        return duration
 
 
 def lan_ips():
