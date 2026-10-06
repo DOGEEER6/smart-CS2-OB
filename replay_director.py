@@ -1645,6 +1645,45 @@ class ReplayDirector:
             return 0.0
         return max(0.0, avail - elapsed)
 
+    def mark_window(self):
+        """
+        给手机提示器用：**现在这个【←】入点还剩多少秒可以按【→】**。
+
+        2026-10-06 真机教训（用户："截取的片段根本不是啊…莫名其妙的一段"）：
+        他 21:57:06 按 ←、21:57:19 才按 →（隔了 12.4 秒），入点早就滚出 10 秒滚动缓冲，
+        引擎只能退化成"整段缓冲从头播" → 拿到的画面起点比他标的晚了 3 秒、
+        而且回合最后两个击杀（21:57:21/23）还没发生 → 看起来就是"莫名其妙的一段"。
+        电脑上的日志虽然写了警告，但人在打游戏时不会去看日志，所以要把
+        **"还能等几秒"直接顶到手机上**。
+
+        公式和 `clip_skip_from_mark()` 完全一致（缓冲边打边滚，裁一次就掏空重攒）：
+            avail = min(record_max_seconds, now - 上次裁素材的时刻)
+            left  = avail - (now - 入点时刻)
+        left <= 0 → 入点已经滚出缓冲，再按 → 只能拿到最近 avail 秒。
+        """
+        cfg = self.cfg
+        dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
+        now = time.time()
+        since_last = now - self._last_snapshot_at if self._last_snapshot_at else dur
+        avail = min(dur, max(0.0, since_last))
+        out = {
+            "bufMax": round(dur, 1),
+            "avail": round(avail, 1),
+            "clipReady": bool(self._snapshot_ok),
+            "clipAgo": (round(now - self._last_snapshot_at, 1)
+                        if self._last_snapshot_at else None),
+            "lastClipSec": (round(float(self.last_clip_seconds), 1)
+                            if getattr(self, "last_clip_seconds", None) else None),
+            "replayActive": bool(self.replay_active),
+            "markAgo": None, "markLeft": None, "expired": False,
+        }
+        if self.mark_in_at:
+            elapsed = max(0.0, now - float(self.mark_in_at))
+            out["markAgo"] = round(elapsed, 1)
+            out["markLeft"] = round(avail - elapsed, 1)
+            out["expired"] = elapsed > avail + 0.2
+        return out
+
     def _apply_start_delay(self, skip):
         """
         把"跳过素材开头 skip 秒"写进 Replay Source 的 StartDelay。
@@ -3099,6 +3138,19 @@ html,body{margin:0;padding:0;background:#0b0f14;color:#e8eef6;
   font-weight:700;animation:cue 1.1s infinite alternate}
 #cue.on{display:block}
 @keyframes cue{from{background:#16321f}to{background:#204d2e}}
+#clipbox{display:none;border-radius:12px;padding:10px 12px;margin-bottom:9px;
+  font-size:17px;line-height:1.45;text-align:center;font-weight:600}
+#clipbox b{font-size:19px}
+#clipbox.arm{display:block;background:#0f2a3a;border:1px solid #2f6f8f;color:#9fd8ff}
+#clipbox.soon{display:block;background:#3a2f10;border:1px solid #a07a20;color:#ffd166;
+  animation:clipblink .7s infinite alternate}
+#clipbox.dead{display:block;background:#3a1414;border:1px solid #a03030;color:#ff9a9a;
+  animation:clipblink .5s infinite alternate}
+#clipbox.ok{display:block;background:#16321f;border:1px solid #2f6f4f;color:#8ee6b0}
+#clipbox.play{display:block;background:#1d2b3a;border:1px solid #3d5a7a;color:#c8d8e8}
+#clipbox.idle{display:block;background:#141c25;border:1px solid #24313f;color:#6d8399;
+  font-size:15px;font-weight:500}
+@keyframes clipblink{from{filter:brightness(1)}to{filter:brightness(1.4)}}
 #killbar{margin-bottom:8px}
 .kb{background:#2a1010;border:1px solid #ff5252;border-radius:11px;
   padding:9px 11px;font-size:17px;margin-bottom:6px;color:#ffd9d9}
@@ -3141,6 +3193,7 @@ html,body{margin:0;padding:0;background:#0b0f14;color:#e8eef6;
 <div id="hdr"><span><span id="dot"></span><b id="map">&mdash;</b> <span id="rnd"></span></span>
   <span id="score"></span></div>
 <div id="state"></div>
+<div id="clipbox"></div>
 
 <div id="autobox">
   <button id="autobtn">自动切换：读取中…</button>
@@ -3160,13 +3213,14 @@ html,body{margin:0;padding:0;background:#0b0f14;color:#e8eef6;
 </div>
 
 <div id="warn"></div>
-<div id="cue">&#9654; 回合结束，按 [ &rarr; ] 抓回放</div>
+<div id="cue">&#9654; 打完了：先按 [ &larr; ] 标入点、再按 [ &rarr; ] 裁出这一段</div>
 <div id="killbar"></div>
 <div id="list"></div>
 </div>
 <div id="tgs"><button class="tg" id="tgb">震动提醒</button><button class="tg" id="tgn">显示名字</button></div>
 <script>
 var vib=false, showNames=false, lastSnapAt=Date.now(), lastKillCount=0;
+var lastSnap=null, clipStage=0;   // 入点提醒阶段：0 没提醒 / 1 快过期 / 2 已过期
 var TOKEN=(new URLSearchParams(location.search)).get('k')||'';
 var autoWanted=null;      // 用户点开关后的期望状态，等服务器确认
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
@@ -3237,6 +3291,48 @@ document.getElementById('tgb').onclick=function(){
 document.getElementById('tgn').onclick=function(){
   showNames=!showNames; this.className='tg'+(showNames?' on':'');
 };
+// ---- 顶部横幅：← 入点还剩几秒可以按 →（缓冲只有 bufMax 秒，超了就框不住）----
+function paintClip(){
+  var box=document.getElementById('clipbox'), d=lastSnap;
+  if(!box) return;
+  if(!d||!d.clip){ box.className=''; box.innerHTML=''; return; }
+  var c=d.clip, cls='', h='';
+  var drift=(Date.now()-lastSnapAt)/1000;
+  if(c.markAgo==null) clipStage=0;
+  var buf=Number(c.bufMax||10).toFixed(0);
+  if(c.markAgo!=null){
+    var ago=Number(c.markAgo)+drift;
+    var left=Number(c.markLeft!=null?c.markLeft:0)-drift;
+    if(left<=0.2){
+      cls='dead';
+      h='<b>&#9888;&#65039; 入点已经滚出缓冲</b><br>现在按 &rarr; 只能给你最近 '+
+        Number(c.avail||0).toFixed(1)+' 秒（起点不是入点）';
+      if(clipStage<2){ clipStage=2;
+        if(vib&&navigator.vibrate) navigator.vibrate([120,90,120,90,120]); }
+    } else if(left<=2.5){
+      cls='soon';
+      h='<b>&#9193;&#65039; 快按 &rarr; ！入点已 '+(ago).toFixed(1)+' 秒</b><br>还剩 '+
+        left.toFixed(1)+' 秒（缓冲 '+buf+' 秒）';
+      if(clipStage<1){ clipStage=1;
+        if(vib&&navigator.vibrate) navigator.vibrate([70,80,70]); }
+    } else {
+      cls='arm';
+      h='<b>&#9193; 入点 '+(ago).toFixed(1)+' 秒</b><br>还剩 '+left.toFixed(1)+
+        ' 秒内按 &rarr;（缓冲 '+buf+' 秒）';
+    }
+  } else if(c.replayActive){
+    cls='play'; h='&#9654; 正在回放…（按小键盘 Enter 收掉再标下一段）';
+  } else if(c.clipReady){
+    cls='ok';
+    h='&#9989; 片段已裁好'+(c.clipAgo!=null?('（'+Math.round(Number(c.clipAgo)+drift)+' 秒前）'):'')+
+      (c.lastClipSec?(' 长 '+Number(c.lastClipSec).toFixed(1)+' 秒'):'')+
+      '<br>小键盘 Enter 播　·　小键盘 6 存文件';
+  } else {
+    cls='idle';
+    h='先按 &larr; 标入点，打完在 '+buf+' 秒内按 &rarr;';
+  }
+  box.className=cls; box.innerHTML=h;
+}
 function render(d){
   if(!d||!d.ready) return;
   document.getElementById('map').textContent=(d.map||'').toUpperCase();
@@ -3318,9 +3414,10 @@ var es=new EventSource('/events');
 es.onmessage=function(e){
   lastSnapAt=Date.now();
   document.getElementById('dot').className='on';
-  try{ render(JSON.parse(e.data)); }catch(x){}
+  try{ lastSnap=JSON.parse(e.data); render(lastSnap); paintClip(); }catch(x){}
 };
 es.onerror=function(){ document.getElementById('dot').className=''; };
+setInterval(paintClip,250);   // 没有新包时也让倒计时继续走
 </script></body></html>
 """
 
@@ -3447,6 +3544,8 @@ class App:
             snap = self.attention.update(payload)
             self.auto.on_packet(snap, self.director)
             snap["auto"] = self.auto.state()
+            # 片段框选状态（← 入点还剩几秒、片段裁好没有）—— 手机页面顶部那条横幅
+            snap["clip"] = self.director.mark_window()
             self._snap_json = json.dumps(snap, ensure_ascii=False)
         except Exception:
             log("!! 提示器/自动切换计算出错:\n" + traceback.format_exc())
