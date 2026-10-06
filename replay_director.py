@@ -208,9 +208,13 @@ DEFAULTS = {
     #   —— 是真裁掉，不是快进。
     #   为什么需要：回合结束那一刻往前 10 秒里，往往前 7 秒都是死了的人在跑图，
     #   真正决定回合的那一枪在最后 2 秒。
-    "entry_align_to_kill": True,      # 按"本回合最后一次击杀"对齐入点
+    "entry_align_to_kill": True,      # 按"本回合镜头拍到的那一枪"对齐入点
     "entry_lead_seconds": 2.0,        # 入点留在击杀前几秒（0 = 正好从击杀开始）
     "entry_min_keep_seconds": 2.5,    # 不管怎么对齐，至少留这么多秒可播
+    # ★ 多杀/连杀：相邻两枪间隔不超过这么多秒就算**同一串**，入点按"这串的第一枪"
+    #   往前留 lead 秒 —— 决胜常常是 3 杀/4 杀连收，只按最后那一枪会把这串前面
+    #   两枪全裁掉（用户 2026-10-06 指出）。0 = 关掉，回到"只按最后一枪"。
+    "entry_streak_gap_seconds": 5.0,
 
     # --- 和 Astra 的协作（重要）---
     # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
@@ -449,6 +453,10 @@ class MatchState:
         self.dead_windows = []        # 观察到的"回合结束→下一回合开打"窗口时长
         self._pcache = {}             # steamid -> {state, match_stats, weapons, team, name}
         self._pseen = {}              # steamid -> 最后一次出现的时刻
+        # 现在镜头（观察位）在谁身上 —— GSI 顶层的 player 就是"观察者正在看的那个选手"。
+        # 入点对齐要用它判断"这一枪是不是镜头拍到的"（用户定义的决胜击杀）。
+        self.observed_sid = None
+        self.observed_name = None
         self._dead_started_at = None
         self._last_emit_at = 0.0      # 上次"回合结束"上报的时刻（防重复触发）
 
@@ -460,6 +468,15 @@ class MatchState:
     def _on_gsi(self, g: dict):
         now = time.time()
         self.last_packet_at = now
+
+        # --- 镜头现在在谁身上 ---
+        # GSI 顶层 `player` 就是"观察者正在看的那个选手"（部分包会缺这一块 → 沿用上次的）。
+        obs = ((g.get("player") or {}).get("steamid") or "").strip()
+        if obs:
+            self.observed_sid = obs
+            o = ((g.get("player") or {}).get("name") or "").strip()
+            if o:
+                self.observed_name = o
 
         # --- 地图变化 / 回合号回退 → 整个重置 ---
         m = (g.get("map") or {}).get("name")
@@ -533,8 +550,10 @@ class MatchState:
                     self.live.final_kills[sid] = k
                     self.live.kills_total += (k - prev)
                     if self.on_kill_cb:
+                        # "镜头拍到的击杀" = 击杀者的 steamid 就是当前观察位那个人
+                        on_cam = bool(self.observed_sid and sid == self.observed_sid)
                         try:
-                            self.on_kill_cb(sid, k, round_no, c.get("name") or sid)
+                            self.on_kill_cb(sid, k, round_no, c.get("name") or sid, on_cam)
                         except Exception:
                             log("!! on_kill 回调出错:\n" + traceback.format_exc())
             if "round_totaldmg" in st:
@@ -897,6 +916,18 @@ class ReplayDirector:
         self._last_kill_at = 0.0
         self._last_kill_round = None
         self._last_kill_name = ""
+        # ★ 用户定义的"决胜击杀"：**镜头（观察位）正拍着那个击杀者**的那一枪。
+        #   只记镜头拍到的，回放入点优先对齐它 —— 回放里能看到"镜头切到他身上 →
+        #   他完成最后击杀"这一整段，而不是随便哪个没拍到的人偷偷打死人。
+        self._last_seen_kill_at = 0.0
+        self._last_seen_kill_round = None
+        self._last_seen_kill_name = ""
+        # 这一串"镜头拍到的连杀"（多杀）的起点 —— 入点要对齐串头，不是串尾
+        self._seen_streak_start_at = 0.0
+        self._seen_streak_round = None
+        self._seen_streak_count = 0
+        self._seen_streak_names = []     # 这串里都有谁（可能换人，比如 A 打两枪 B 补最后一枪）
+        self._entry_note = ""            # 这次入点对齐用的是哪种击杀（写日志用）
         self._start_delay_checked = False  # 是否已经验证过 StartDelay 能写进插件
         # 人工接管锁的自动过期
         self._locked_at = 0.0
@@ -1040,19 +1071,60 @@ class ReplayDirector:
         return True if self.replay_item_id is not None else False
 
     # ---------------- 击杀事件：计划快照 ----------------
-    def on_kill(self, sid, kill_count, round_no, name):
+    def on_kill(self, sid, kill_count, round_no, name, on_camera=None):
         """检测到击杀。
 
         ★ 不管自动回放开没开，**都要记下击杀时刻** —— 入点对齐
           （把回放开头挪到决胜击杀之前）靠的就是"这回合最后一枪是什么时候"。
+
+        ★★ `on_camera`（镜头/观察位正拍着这个击杀者）是**用户定义的"决胜击杀"**：
+           "镜头切到他身上并且完成最后击杀才算"。两种时刻分开记：
+             * `_last_kill_*`      —— 这一回合最后一枪（任何人，兜底用）
+             * `_last_seen_kill_*` —— 镜头拍到的最后一枪（入点**优先**对齐它）
+           并且镜头拍到的相邻两枪（间隔 <= `entry_streak_gap_seconds`、同回合）会串成
+           一串连杀，入点对齐**串头**（`_seen_streak_*`）—— 3 杀/4 杀收尾时不能只留最后那一枪。
+          `on_camera=None` 表示调用方没传（命令行/仿真/单测直接调），
+          这时回退去读 `state_ref.observed_sid`。
         （`auto_replay` 关掉时，下面"排一个延迟快照"的部分就不走了。）
         """
         cfg = self.cfg
         now = time.time()
+        if on_camera is None:
+            sr = self.state_ref
+            osid = getattr(sr, "observed_sid", None) if sr is not None else None
+            on_camera = bool(osid and sid == osid)
         if kill_count and int(kill_count) >= 1:
             self._last_kill_at = now
             self._last_kill_round = round_no
             self._last_kill_name = name or ""
+            if on_camera:
+                # --- 多杀/连杀：看看这一枪能不能接在上一枪后面串成同一串 ---
+                # 相邻两枪（都是镜头拍到的）间隔 <= entry_streak_gap_seconds 且同回合
+                # → 算同一串，串头不变；否则这一枪自己开一串。
+                gap = float(cfg.get("entry_streak_gap_seconds", 5.0) or 0.0)
+                same_streak = bool(
+                    gap > 0 and self._seen_streak_round == round_no
+                    and self._last_seen_kill_at
+                    and (now - self._last_seen_kill_at) <= gap)
+                if same_streak:
+                    self._seen_streak_count += 1
+                    if name and name not in self._seen_streak_names:
+                        self._seen_streak_names.append(name)
+                else:
+                    self._seen_streak_start_at = now
+                    self._seen_streak_round = round_no
+                    self._seen_streak_count = 1
+                    self._seen_streak_names = [name] if name else []
+                self._last_seen_kill_at = now
+                self._last_seen_kill_round = round_no
+                self._last_seen_kill_name = name or ""
+                streak = (f" → 这串连杀第 {self._seen_streak_count} 枪，入点对齐这一串的头"
+                          if self._seen_streak_count > 1 else " → 记作决胜击杀，入点对齐这一枪")
+                logv(cfg, f"   [击杀] {name or sid[:8]} 第 {kill_count} 杀"
+                          f"（镜头正好在他身上{streak}）")
+            else:
+                logv(cfg, f"   [击杀] {name or sid[:8]} 第 {kill_count} 杀"
+                          f"（镜头不在他身上 → 只作普通记录，入点优先找镜头拍到的那一枪）")
         if not cfg.get("auto_replay", False):
             return
         if not cfg.get("snapshot_on_kill", True):
@@ -1421,17 +1493,51 @@ class ReplayDirector:
         素材里"击杀发生在第几秒"是可算的：
             击杀在素材内的偏移 = 素材长度 - (定格时刻 - 最后一次击杀时刻)
             入点 = 该偏移 - entry_lead_seconds（提前一点，能看清是谁开的枪）
+
+        ★ 用户 2026-10-06 补充定义："决胜击杀回放是指：**镜头切到他身上并且完成
+          最后击杀才算**。每局默认留几秒，用于事后重放。"
+          → 入点**优先**对齐"镜头（观察位）正拍着那个击杀者"的那一枪
+          （`_last_seen_kill_*`），这样回放里能看到"镜头切到他身上 → 他完成最后击杀"；
+          这一回合镜头一次都没拍到击杀者时，才退回"最后一枪"（`_last_kill_*`），
+          并在日志里说明（`_entry_note`）。
+
+        ★★ 但决胜常常是**多杀/连杀**（3 杀、4 杀收尾）——只按最后一枪会把这一串
+          前面的枪全裁掉，所以锚点是**这一串连杀的第一枪**（`_seen_streak_start_at`）：
+          相邻两枪（都是镜头拍到的、同一回合）间隔 <= `entry_streak_gap_seconds`
+          就算同一串。多杀一整串的长度是可预期的（CS 的连杀判定窗口就是 5 秒左右），
+          所以"每局默认留几秒"= 串头前 lead 秒 → 定格那一刻，正好是一小段。
         """
         cfg = self.cfg
+        self._entry_note = ""
         if not cfg.get("entry_align_to_kill", True):
             return 0.0
-        kill_at = self._last_kill_at
+        # --- 选锚点：先是"镜头拍到的（连杀串头）"，没有才退回"最后一枪" ---
+        seen_ok = bool(self._last_seen_kill_at) and not (
+            round_no is not None and self._last_seen_kill_round is not None
+            and self._last_seen_kill_round != round_no)
+        if seen_ok:
+            # 锚点是"这一串连杀的第一枪"：多杀时不能只看最后一枪
+            streak_ok = bool(self._seen_streak_start_at) and not (
+                round_no is not None and self._seen_streak_round is not None
+                and self._seen_streak_round != round_no)
+            kill_at = self._seen_streak_start_at if streak_ok else self._last_seen_kill_at
+            kill_round = self._seen_streak_round if streak_ok else self._last_seen_kill_round
+            kill_who = ("、".join(self._seen_streak_names) if (streak_ok and self._seen_streak_names)
+                        else self._last_seen_kill_name)
+            n = self._seen_streak_count if streak_ok else 1
+            tag = (f"镜头拍到的决胜连杀 ×{n}" if n and n > 1
+                   else "镜头拍到的决胜击杀")
+        else:
+            kill_at = self._last_kill_at
+            kill_round = self._last_kill_round
+            kill_who = self._last_kill_name
+            tag = "最后一枪（本回合镜头没拍到击杀者）"
         if not kill_at:
             return 0.0
         # 只在"这次要播的回合 == 记录到击杀的那个回合"时才敢裁，
         # 免得拿上一回合的击杀时刻去裁这一回合的素材。
-        if (round_no is not None and self._last_kill_round is not None
-                and self._last_kill_round != round_no):
+        if (round_no is not None and kill_round is not None
+                and kill_round != round_no):
             return 0.0
         dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
         # 现在正在定格：新素材的结尾就是这一刻。
@@ -1440,7 +1546,11 @@ class ReplayDirector:
         skip = offset - float(cfg.get("entry_lead_seconds", 2.0))
         # 至少给观众留 entry_min_keep_seconds；击杀在片头时 offset 天然为负 → 不裁。
         keep = max(0.5, float(cfg.get("entry_min_keep_seconds", 2.5)))
-        return max(0.0, min(skip, dur - keep))
+        skip = max(0.0, min(skip, dur - keep))
+        self._entry_note = f"{tag} · {kill_who}" if kill_who else tag
+        if skip <= 0.05:
+            self._entry_note += "（已经在片头附近，不用裁）"
+        return skip
 
     def _apply_start_delay(self, skip):
         """
@@ -1523,8 +1633,10 @@ class ReplayDirector:
             # ★ 入点对齐：先算出"跳过素材开头多少秒"，在触发定格**之前**写进插件。
             skip = self._entry_skip(round_no)
             if skip > 0.05:
-                log(f"   ✂️ 入点：跳过素材开头 {skip:.1f} 秒，从决胜击杀前 "
-                    f"{float(cfg.get('entry_lead_seconds', 2.0)):.1f} 秒处开始")
+                log(f"   ✂️ 入点：跳过素材开头 {skip:.1f} 秒，从「{self._entry_note or '决胜击杀'}」"
+                    f"前 {float(cfg.get('entry_lead_seconds', 2.0)):.1f} 秒处开始")
+            elif self._entry_note:
+                log(f"   ✂️ 入点：{self._entry_note} —— 不用裁，从头播")
             self._apply_start_delay(skip)
             self.obs.request("TriggerHotkeyByName",
                              {"hotkeyName": name, "contextName": cfg["replay_item"]})
@@ -3580,11 +3692,12 @@ def build_sim_round(round_no, kills_by_sid, plant=False, defuse=False, clutch=Fa
     sids = list(names.keys())
 
     def make(phase, kill_counts, alive_ct, alive_t, win_team=None, bomb=False,
-             partial=False, dmg_zero=False):
+             partial=False, dmg_zero=False, watch="1"):
         allp = {}
         for i, sid in enumerate(sids):
             team = "CT" if i < 5 else "T"
-            entry = {"name": names[sid], "team": team, "clan": ""}
+            entry = {"name": names[sid], "team": team, "clan": "",
+                     "observer_slot": i}
             # partial=True 时，只给前 2 个选手完整信息，其余只发 id/team
             if not partial or sid in ("1", "2"):
                 hp = (100 if i < alive_ct else 0) if team == "CT" else (100 if (i - 5) < alive_t else 0)
@@ -3606,20 +3719,37 @@ def build_sim_round(round_no, kills_by_sid, plant=False, defuse=False, clutch=Fa
             # ⚠️ 陷阱 1：真实相位只在这里。round.phase 故意恒为 live。
             "phase_countdowns": {"phase": phase, "phase_ends_in": "8.0"},
             "round": {"phase": "live", "bomb": bomb, "win_team": win_team or ""},
-            "allplayers": allp, "player": {},
+            "allplayers": allp,
+            # ★ 顶层 `player` = 观察位（镜头）正拍着谁。仿真的观察逻辑：谁这回合杀得多
+            #   就看谁（= 真导播"镜头跟着人走"），这样入点对齐能走到"镜头拍到的击杀"分支。
+            "player": {"steamid": watch, "name": names.get(watch, ""),
+                       "observer_slot": sids.index(watch) if watch in sids else 0},
             "bomb": {"state": "planted" if bomb else "carried"},
         }
 
     seq = phase_seq or [("live", 3.0), ("live", 2.0), ("freezetime", 4.0)]
     n = 0
+    watch = "1"          # 镜头（观察位）现在在谁身上
+
+    def pick_watch(kc):
+        """仿真的观察逻辑：谁这回合杀得多，镜头就在谁身上（真导播也是这么跟的）。"""
+        best, bestv = None, 0
+        for sid, v in (kc or {}).items():
+            if int(v or 0) > bestv:
+                best, bestv = sid, int(v or 0)
+        return best
+
     for phase, dur in seq:
         if phase == "over":
             n += 1
+            watch = pick_watch(kills_by_sid) or watch
             yield make("over", kills_by_sid, 0 if not clutch else 1, 2, "CT",
-                       bomb=plant, partial=(n % 2 == 0)), 1.0
+                       bomb=plant, partial=(n % 2 == 0), watch=watch), 1.0
         elif phase == "freezetime":
             n += 1
-            yield make("freezetime", {}, 5, 5, "", partial=(n % 2 == 0)), 1.0
+            watch = "1"          # 新回合：镜头回到默认观察位
+            yield make("freezetime", {}, 5, 5, "", partial=(n % 2 == 0),
+                       watch=watch), 1.0
         else:
             # live / bomb / defuse：逐步推进击杀数，且保留真实相位名
             steps = max(1, int(dur / 1.5))
@@ -3627,8 +3757,9 @@ def build_sim_round(round_no, kills_by_sid, plant=False, defuse=False, clutch=Fa
                 n += 1
                 frac = (s + 1) / steps
                 kc = {sid: int(v * frac) for sid, v in kills_by_sid.items()}
+                watch = pick_watch(kc) or watch
                 yield make(phase, kc, max(1, 5 - int(3 * frac)), 5 - int(3 * frac),
-                           bomb=plant, partial=(n % 2 == 0)), 0.35
+                           bomb=plant, partial=(n % 2 == 0), watch=watch), 0.35
 
 
 def run_simulate(cfg):
