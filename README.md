@@ -314,6 +314,7 @@ prob  = 1 / (1 + exp(−(powerA − powerB) / 22))
         ├─ 算播放时长： hold = 素材秒数 ÷ speed(0.7)
         │
         ├─ 切到回放场景 → 显示回放源 → 触发 ReplaySource.Replay 热键
+        │      （插件里这个热键 = Load replay：从滚动缓冲取一段素材）
         │      （参数里写好 next_scene = 直播场景，交给插件自己切回来）
         │
         └─ 收尾：先把场景切回直播，再隐藏回放源
@@ -390,12 +391,26 @@ skip    = max(0, avail - elapsed)                       # 要跳过的片头长�
 ```
 切到回放场景  →  显示回放源  →  立刻 ReplaySource.Pause（定格在第一帧）
                               ↓  等 3.35 秒包装放完
-                          ReplaySource.Replay（从暂停那一帧继续）
+                         媒体接口 PLAY（同一段素材，从定格那一帧继续）
 ```
 
 - 插件的暂停是**切换式**的，而 `replay_restart_at_begin` 里
   `pause_timestamp = c->play ? 0 : os_timestamp` —— 刚显示完就暂停，正好停在**片段第一帧**；
-  恢复时 `start_timestamp += now - pause_timestamp`，从那一帧继续，**不会跳过片段**。
+  续播走 **obs-websocket 的媒体接口**（`TriggerMediaInputAction` 的 `PLAY`，对应插件
+  `replay_play_pause(data, false)`）：只把 `play` 置回 true、把暂停时长补进 `start_timestamp`，
+  **同一段素材**从定格那一帧继续，不会跳过片段。
+- ⚠️ **续播千万不能用 `ReplaySource.Replay` 热键**（2026-10-06 修）：插件源码里这个热键
+  （`replay_hotkey` :1233-1247）打的是 `Load replay pressed`，跟的是 `replay_retrieve()`
+  —— 它**重新从滚动缓冲取一段素材**，并且在取素材那一刻按当时的 `start_delay` 重算裁头。
+  续播时再取一次，拿到的是"尾巴 = 恢复那一刻"的新素材，内容整体后移。
+  现场症状：按 `←` 标的是 21:43:12~14 那一段，播出来却是 21:43:44~46
+  （`→` 到按小键盘 Enter 隔了 27 秒，再加 3.35 秒包装转场）。
+- 万一这套 obs-websocket 没有 `TriggerMediaInputAction`，退回插件 `ReplaySource.Restart`
+  热键（`replay_restart` :676-682：`restart = true; play = true`）—— 仍是**同一段素材**，
+  只是从入点重新播一遍，内容不会错。
+- 定格那一步也不盲按：先等回放源真的进 `PLAYING`（最长 0.5 秒）再按 Pause，
+  否则切换式的 Pause 会把本来停着的源**播起来**。启动时 preflight 会确认一次媒体接口，
+  日志里写 `✅ 媒体接口可用：转场放完从定格那一帧续播，不会重新取素材`。
 - 播放窗口（引擎掐时间的兜底）也把等待时间算进去了：`replay_until = now + wrap + hold + 5`。
 - 转场还没放完就结束了回放（手动切回 / 新回合开打）→ 取消"待恢复"，不会切回直播后又自己播起来。
 - 配置：`replay_wrap_seconds`（`null` = 自动读当前转场；填数字 = 强制等这么久；`0` = 回到旧行为）、

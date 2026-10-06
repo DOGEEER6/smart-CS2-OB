@@ -642,6 +642,19 @@ class MatchState:
 # 3. obs-websocket v5 客户端
 # ============================================================================
 
+# obs-websocket 的媒体控播动作名（TriggerMediaInputAction 的 mediaAction）。
+# ★ 为什么非得用媒体接口而不是热键（2026-10-06 真机实测的坑）：
+#   插件的 `ReplaySource.Replay` 是 "Load replay"（replay-source.c:1233 replay_hotkey
+#   → replay_retrieve），按下去会**重新从滚动缓冲取一段**；拿它当"继续播放"用，
+#   素材尾巴就变成"按下的那一刻"，播出来根本不是用户框的那一段
+#   （用户原话："你那截的啥？根本就不是我标记的那一段"）。
+#   媒体接口 PLAY → 插件 replay_play_pause(data, false)（:722-757）才是
+#   "从 pause_timestamp 处继续"，既不重新取素材、也不动 start_delay。
+MEDIA_ACTION_PLAY = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY"
+MEDIA_ACTION_PAUSE = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE"
+MEDIA_ACTION_RESTART = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+
+
 class ObsClient:
     """最小实现的 obs-websocket v5 客户端（op 0/1/2/5/6/7）。"""
 
@@ -801,6 +814,19 @@ class ObsClient:
         d = self.request("GetInputSettings", {"inputName": name})
         return d.get("inputKind"), (d.get("inputSettings") or {})
 
+    def trigger_media_action(self, input_name, action):
+        """控播动作（obs-websocket TriggerMediaInputAction）。
+
+        这是"续播 / 定格"唯一正确的通道：走的是插件的 media_play_pause 等回调，
+        **不会**像 `ReplaySource.Replay` 那样重新从滚动缓冲取一段素材。
+        """
+        return self.request("TriggerMediaInputAction",
+                            {"inputName": input_name, "mediaAction": action})
+
+    def media_input_status(self, input_name):
+        """读媒体源状态（mediaState / mediaDuration / mediaCursor）。"""
+        return self.request("GetMediaInputStatus", {"inputName": input_name})
+
 
 class NullObsClient:
     """仿真 / 空跑用的假 OBS。"""
@@ -837,6 +863,17 @@ class NullObsClient:
             if it["sceneItemId"] == item_id:
                 it["sceneItemEnabled"] = enabled
         return {}
+
+    def trigger_media_action(self, input_name, action):
+        self.calls.append(("TriggerMediaInputAction", input_name, action))
+        log(f"    [OBS] 媒体动作 {action} @ {input_name}")
+        return {}
+
+    def media_input_status(self, input_name):
+        self.calls.append(("GetMediaInputStatus", input_name))
+        # 仿真里假装"回放源刚显示、正在播"（真机上 visibility_action=Restart 就是这个状态），
+        # 这样定格 / 续播两条通路在仿真里都会被走到。
+        return {"mediaState": "OBS_MEDIA_STATE_PLAYING", "mediaDuration": 10000, "mediaCursor": 0}
 
     def input_settings(self, name):
         return "replay_source", {"source": "游戏采集", "duration": 5.0, "speed": 0.7}
@@ -986,6 +1023,19 @@ class ReplayDirector:
 
         # ★ 包装转场（stinger）会盖住回放片头：启动时报一次它有多长（只报一次）。
         _ = self._wrap_seconds()
+
+        # ★ 2026-10-06：转场放完怎么"续播"——必须走媒体接口，不能按 ReplaySource.Replay
+        #   （那是插件的 Load replay，会重新取一段素材，播出来不是用户框的那段）。
+        #   这里先确认接口在；不在就明确告诉用户会退回 Restart（内容仍对，只是不吃定格）。
+        try:
+            avail = set((self.obs.request("GetVersion") or {}).get("availableRequests") or [])
+            if "TriggerMediaInputAction" in avail:
+                log("   ✅ 媒体接口可用：转场放完从定格那一帧续播，不会重新取素材")
+            elif avail:
+                log("   ⚠️  这个 obs-websocket 没有 TriggerMediaInputAction —— 转场续播会退回"
+                    "插件 Restart 热键（同一段素材从头播，内容仍然是你框的那一段）")
+        except Exception as e:
+            logv(cfg, f"   （核对媒体接口失败，忽略: {e}）")
 
         # ★ 小键盘 6 = 保留片段：把"存到哪儿 / 文件名格式"写进插件。
         #   插件源码 :3070 `obs_properties_add_path(... OBS_PATH_DIRECTORY ...)` 的
@@ -1365,19 +1415,14 @@ class ReplayDirector:
             #   而 set_item_enabled(True) 触发 visibility_action=Restart 正是这个状态。
             self._wrap_resume_at = 0.0
             if wrap > 0.05:
-                t0 = time.time()
-                try:
-                    self._hk("ReplaySource.Pause")
-                    used_ms = (time.time() - t0) * 1000.0
-                    self._wrap_resume_at = time.time() + wrap
-                    log(f"   🎁 包装转场 {wrap:.2f} 秒：回放先定格在第一帧"
-                        f"（暂停耗时 {used_ms:.0f}ms），{wrap:.2f} 秒后自动开播")
-                    lim = float(self.cfg.get("wrap_pause_max_ms", 250) or 250)
-                    if used_ms > lim:
-                        log(f"      ⚠️ 暂停调用用了 {used_ms:.0f}ms（>{lim:.0f}ms），"
-                            f"片头可能已经跑掉约 {used_ms/1000:.2f} 秒")
-                except Exception as e:
-                    log(f"   ⚠️ 定格第一帧失败（片头可能被转场盖住）: {e}")
+                used_ms = self._freeze_first_frame()
+                self._wrap_resume_at = time.time() + wrap
+                log(f"   🎁 包装转场 {wrap:.2f} 秒：回放先定格在第一帧"
+                    f"（暂停耗时 {used_ms:.0f}ms），{wrap:.2f} 秒后自动续播")
+                lim = float(self.cfg.get("wrap_pause_max_ms", 250) or 250)
+                if used_ms > lim:
+                    log(f"      ⚠️ 暂停调用用了 {used_ms:.0f}ms（>{lim:.0f}ms），"
+                        f"片头可能已经跑掉约 {used_ms/1000:.2f} 秒")
         except Exception:
             log("!! 启动回放失败:\n" + traceback.format_exc())
             self._end_replay("启动失败")
@@ -1387,6 +1432,74 @@ class ReplayDirector:
         """触发 Replay Source 的源级热键（必须带 contextName）。"""
         self.obs.request("TriggerHotkeyByName",
                          {"hotkeyName": name, "contextName": self.cfg["replay_item"]})
+
+    # ------------------------------------------------------------------
+    def _media_state(self):
+        """读回放源的媒体状态；读不到返回 None（老版本 obs-websocket 或请求失败）。"""
+        try:
+            d = self.obs.media_input_status(self.cfg["replay_item"])
+            return d.get("mediaState")
+        except Exception as e:
+            logv(self.cfg, f"   （读媒体状态失败，忽略: {e}）")
+            return None
+
+    def _wait_media_state(self, want, timeout=0.5):
+        """轮询等媒体状态变成 want 里的某一个；超时返回最后读到的状态（读不到返回 None）。"""
+        st = None
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            st = self._media_state()
+            if st is None or st in want or time.time() >= deadline:
+                return st
+            time.sleep(0.05)
+
+    def _freeze_first_frame(self):
+        """显示回放源之后，让它停在片段第一帧上（等包装转场放完再续播）。
+
+        插件语义（replay-source.c）：
+          * `replay_source_active`（:637-655）：源变可见时 visibility_action=Restart(0)
+            → `play = true; restart = true` —— 一露头就开始播。
+          * `ReplaySource.Pause` 热键 = `replay_play_pause(data, true)`（:768-775）
+            是**切换式**的（:722-757）：正在播 → 暂停；已经暂停 → 开播。
+        所以这里先读一眼状态，确认它确实在播再按 Pause（盲按有可能反而把它播起来）；
+        读不到状态（老 OBS）就按老办法直接按一下。
+        """
+        st = self._wait_media_state(("OBS_MEDIA_STATE_PLAYING",), timeout=0.5)
+        t0 = time.time()
+        if st is None or st == "OBS_MEDIA_STATE_PLAYING":
+            try:
+                self._hk("ReplaySource.Pause")
+            except Exception as e:
+                log(f"   ⚠️ 定格第一帧失败（片头可能被转场盖住）: {e}")
+                return 0.0
+        else:
+            logv(self.cfg, f"   （回放源现在已经是 {st}，不用按 Pause）")
+        return (time.time() - t0) * 1000.0
+
+    def _resume_playback(self):
+        """包装转场放完了 → 让回放**从定格那一帧继续播**。
+
+        ⚠️ 2026-10-06 真机实测修正（用户："你那截的啥？根本就不是我标记的那一段"）：
+        以前这里按的是 `ReplaySource.Replay`，那是插件的 "Load replay"
+        （replay-source.c:1233 `replay_hotkey` → `replay_retrieve`）——**会重新从滚动缓冲
+        取一段**，而 `start_delay` 还是原来那个值，于是素材尾巴变成"按下的那一刻"，
+        播出来整段后移（实测 21:43 那次：标记的是 21:43:12~14，播出来的是 21:43:44~46）。
+        正确通道是媒体的 PLAY：插件 `replay_play_pause(data, false)` 会把
+        `start_timestamp` 按暂停时长补回去 → 接着定格那一帧往下播，不重新取素材。
+        """
+        try:
+            self.obs.trigger_media_action(self.cfg["replay_item"], MEDIA_ACTION_PLAY)
+            return True
+        except Exception as e:
+            # 老 obs-websocket 没有媒体接口时的退路：Restart 是"同一段素材从头播"，
+            # 也**不会**重新取素材，内容仍然是你框的那一段（只是不吃定格那一下）。
+            log(f"   ⚠️ 媒体接口 PLAY 失败（{e}）→ 改用插件 Restart（同一段素材从头播）")
+            try:
+                self._hk("ReplaySource.Restart")
+                return True
+            except Exception:
+                log("!! 恢复回放播放失败:\n" + traceback.format_exc())
+                return False
 
     # ------------------------------------------------------------------
     def _detect_wrap(self):
@@ -1728,18 +1841,16 @@ class ReplayDirector:
         """包装转场放完了 → 让回放真正开始播。
 
         和 `_start_replay` 里的"定格第一帧"配对：那边显示回放源后立刻 Pause，
-        这里等 stinger 放完再 Replay（插件是**切换式**暂停，Replay 就是从暂停处继续，
-        不会跳过片段）。单独拆成方法是为了能脱离 ticker 死循环做单测。
+        这里等 stinger 放完再续播（用媒体接口 PLAY，**绝不能**再按
+        `ReplaySource.Replay` —— 那是 Load replay，会重新取一段素材，
+        见 `_resume_playback` 的说明）。单独拆成方法是为了能脱离 ticker 死循环做单测。
         """
         if not (self.replay_active and self._wrap_resume_at
                 and time.time() >= self._wrap_resume_at):
             return False
         self._wrap_resume_at = 0.0
-        try:
-            self._hk("ReplaySource.Replay")
-            log("   ▶️ 包装转场放完，回放开始播")
-        except Exception:
-            log("!! 恢复回放播放失败:\n" + traceback.format_exc())
+        if self._resume_playback():
+            log("   ▶️ 包装转场放完，回放从定格那一帧继续播（没有重新取素材）")
         return True
 
     def _expire_manual_lock(self):
@@ -3691,6 +3802,7 @@ def run_probe(cfg):
     avail = set(ver.get("availableRequests") or [])
     need = ["SetCurrentProgramScene", "GetSceneList", "GetSceneItemList",
             "SetSceneItemEnabled", "GetInputSettings", "TriggerHotkeyByName",
+            "TriggerMediaInputAction", "GetMediaInputStatus",
             "SaveReplayBuffer", "GetReplayBufferStatus", "GetRecordDirectory"]
     log("本机支持的请求名核对：")
     for n in need:
