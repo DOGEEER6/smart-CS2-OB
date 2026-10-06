@@ -161,30 +161,17 @@ DEFAULTS = {
     #   不再自动判断"该不该回放"。想恢复自动判断就改成 true。
     "auto_replay": False,
 
-    # --- 手动键盘控制（默认工作方式）---
-    #   ←  开始录制：清空缓冲，从此刻开始累积素材
-    #   →  结束录制：把这一段定稿成一段可播放的回放
-    #   小键盘Enter：切到回放场景播放；再按一次立刻切回直播
-    # --- 手动键盘控制 ---
-    # record_mode:
-    #   "retrospective"（默认，推荐单人导播）只用 → ：
-    #        回合结束按一次 → 就抓"最近 N 秒"（击杀通常就在里面），
-    #        不用在交火那一瞬间腾出手按键。切视角和回放彻底在时间上分开。
-    #   "bracket" 精确框选：← 开始 / → 结束，正好框住那一段，
-    #        但必须在交火瞬间按 ←，单人操作容易漏。
-    "record_mode": "retrospective",
+    # --- 手动键盘控制（唯一的工作方式：手动框选片段）---
+    #   ←  左方向键   标记入点：记住"这一刻"
+    #   →  右方向键   标记出点：把"入点 → 现在"这一段裁成一段素材（结尾就停在出点）
+    #   小键盘6       保留片段：把当前这段素材另存成视频文件（赛后能剪出去发）
+    #   小键盘Enter   切到回放场景播放；再按一次立刻切回直播
+    # ★ 2026-10-06 用户决定：**去掉所有自动定格**（回合结束自动抓、击杀后延迟抓都删掉了）。
+    #   素材完全由 ← / → 两个键框出来；引擎不会在你没按键的时候去碰回放缓冲。
     "manual_keys": True,
     "record_max_seconds": 10.0,       # 滚动缓冲/单段素材最长多少秒（会写进插件的 Duration）
     "key_debounce": 0.5,              # 同一按键的重复触发间隔（秒）
-    # ★ 回合结束后自动"定格"素材：GSI 一看到 phase 变成 over，就等这么久做快照。
-    #   这样素材的**结尾正好是回合结束后 1 秒**，后面那些冻结时间/跑位全是废的，
-    #   不用你再掐着表按 →。
-    "auto_capture_on_round_end": True,
-    "capture_after_round_end": 1.0,   # 回合结束后多久定格（秒）
-    # 抓到之后要不要自动播。既然现在每回合都会自动定格，默认改成"手动按 Enter 播"，
-    # 不然就变成每回合都自动放一遍回放了。
-    "auto_play_after_capture": False,
-    "auto_play_delay": 0.5,
+    "min_clip_seconds": 0.3,          # ← 到 → 至少隔这么久才算有效（防手抖双击）
     # ★ 提前多久切回直播场景。现在默认 **0**：改由插件在片子结束那一帧触发切回
     #   （见 preflight 里写的 next_scene）。只有你把 next_scene 清空、
     #   想让引擎自己掐时间时才需要设成 0.9 之类。
@@ -193,27 +180,11 @@ DEFAULTS = {
     # 自动模式下会自动设为 True。想强制让位就写 true。
     "interrupt_on_live": None,
 
-    # --- 回放素材的取样时机（关键）---
-    # 回放缓存的是"触发那一刻往前 N 秒"。如果在回合结束时才快照，拿到的
-    # 是回合最后几秒的垃圾时间（跑位/拆枪），击杀早就过去了。
-    # 所以要在**击杀发生的那一刻**快照存下来，回合结束时才播。
-    "snapshot_on_kill": True,         # 击杀时快照（关掉就退回旧的"回合末快照"行为）
-    "snapshot_delay": 1.2,            # 击杀后等几秒再快照，让击杀落在片子中间而不是末尾
+    # --- 回放素材从哪来 ---
+    # ★ 2026-10-06 用户决定：**没有自动取样**。素材只由 ← / → 手动框选产生
+    #   （← 标入点；→ 标出点，并且**当场**把"入点 → 现在"这一段从滚动缓冲里裁出来）。
+    #   所以这里只剩一个写给插件用的 Load Delay。
     "retrieve_delay_ms": 0,           # 同时写入插件的 "Load Delay"（一般保持 0）
-
-    # ★ 回放长度：**固定只播最后 N 秒**。
-    #   做法：定格前把 Replay Source 的 StartDelay 写成负值（= 从片段开头跳过这么久），
-    #   插件在 replay_retrieve() 里会把它变成 trim_front，播放时直接跳到入点
-    #   —— 是真裁掉，不是快进。
-    #   为什么需要：回合结束那一刻往前 10 秒里，前几秒往往都是跑位/架枪，
-    #   真正决定回合的交火在最后几秒。
-    #   ★ 2026-10-06 用户决定：**不要再"识别"击杀来算入点**（那套逻辑已删掉），
-    #     就固定播最后这么多秒；要调长度只改这一个数。
-    #     0 或 <=0 = 不用裁，整段缓冲都播。
-    #   ★ 2026-10-06 后续（用户："回放太短了，刚切过去就结束了，10 秒慢放吧"）：
-    #     默认改成 **10.0** = 跟 `record_max_seconds`（默认 10）一样长 → 整段缓冲都播，
-    #     不再裁开头；按 70% 慢放出来约 14 秒。想短一点就把这个数调小。
-    "play_tail_seconds": 10.0,
 
     # --- ★ 包装转场（stinger）不许吃掉回放片头 ---
     # 你的 OBS 当前转场是「转场」= obs_stinger_transition，素材
@@ -229,10 +200,10 @@ DEFAULTS = {
     "replay_wrap_seconds": None,
     "wrap_pause_max_ms": 250,         # 暂停调用超过这么多 ms 就打警告（片头可能跑掉一点）
 
-    # --- ★ 小键盘右键：保留本场回放片段（把素材另存成视频文件）---
+    # --- ★ 小键盘 6：保留本场回放片段（把素材另存成视频文件）---
     # 按一下 = 让 Replay Source 把"当前那段素材"写成一个文件，事后能剪出去发。
     # 存出来的是**入点之后**的内容（插件 replay_save() 会照旧应用 trim_front），
-    # 和你在回放里看到的一致；没有定稿过素材时按下什么都不会发生（插件自己会拦）。
+    # 和你在回放里看到的一致；没有裁过素材时按下什么都不会发生（插件自己会拦）。
     #   save_dir 留空 = 存到 OBS 的录制目录（GetRecordDirectory，你现在是 E:/Paris2024）
     "save_replay_key": True,
     "save_dir": "",
@@ -250,7 +221,7 @@ DEFAULTS = {
     # ★ 人工接管的锁有有效期：一旦锁上，过了这么久就自动交还给引擎。
     #   为什么必须有：实测踩过 —— 回放中 Astra 按阶段把场景切到「数据看板」，
     #   引擎把它当成"人工接管"锁死，**整场比赛再没解锁**，
-    #   于是后面每个回合结束都不再定格素材，你按 Enter 只能播到很早以前那一段。
+    #   于是后面每个回合你按 Enter 都只能播到很早以前那一段素材。
     #   0 = 永不过期（不建议）。
     "manual_lock_seconds": 45.0,
 
@@ -324,15 +295,15 @@ class GsiHandler(http.server.BaseHTTPRequestHandler):
             ok = app.manual_replay()
             body = json.dumps({"ok": ok}).encode("utf-8")
             code = 200 if ok else 409
-        elif path == "/control/record_start":
-            body = json.dumps({"ok": app.record_start()}).encode("utf-8")
+        elif path in ("/control/mark_in", "/control/record_start"):
+            body = json.dumps({"ok": app.mark_in()}).encode("utf-8")
             code = 200
-        elif path == "/control/record_stop":
-            body = json.dumps({"ok": app.record_stop()}).encode("utf-8")
+        elif path in ("/control/mark_out", "/control/record_stop"):
+            body = json.dumps({"ok": app.mark_out()}).encode("utf-8")
             code = 200
         else:
             body = (b'{"error":"use /control/status | /lock | /unlock | /replay'
-                    b' | /record_start | /record_stop"}')
+                    b' | /mark_in | /mark_out"}')
             code = 404
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -916,17 +887,13 @@ class ReplayDirector:
         self.overlay_item_ids = []
         self.video_source_name = ""      # 回放源绑定的游戏采集源名（preflight 里填）
         self._last_load_replay = 0.0
-        self._snapshot_round = None      # 快照属于哪个回合
-        self._snapshot_ok = False        # 本回合是否已经拿到了"击杀瞬间"的快照
-        self._last_snapshot_at = 0.0     # 上次快照的时刻（手动回放会复用 20 秒内的）
-        self._pending_snapshot_at = 0.0  # 计划在什么时刻做快照（击杀后延迟 / 回合结束后）
-        self._pending_reason = ""        # 这次定时定格是为了什么（写日志用）
-        self._pending_round = None       # 这次定时定格属于哪个回合（判断素材新旧要用）
-        self._snapshot_kills = 0         # 本回合已快照的击杀数（用于日志）
-        self.last_clip_seconds = None    # 最近一次快照的**可播**长度（已扣掉裁掉的开头）
+        self._snapshot_ok = False        # 手里有没有一段裁好的素材（按 → 标出点时产生）
+        self._last_snapshot_at = 0.0     # 上次裁素材的时刻（= 缓冲区被掏空、重新开始累积的时刻）
+        self.mark_in_at = 0.0            # ★ 按 ← 标下的入点时刻（0 = 还没标）
+        self.last_clip_seconds = None    # 最近一次裁出来的**可播**长度（已扣掉裁掉的开头）
         self.last_clip_raw_seconds = None  # 插件报的原始长度（未裁）
-        self.last_clip_trim = 0.0        # 这一段裁掉了开头多少秒（play_tail_seconds）
-        self._last_clip_end_at = 0.0     # 定格那一刻（= 素材的结尾时刻）
+        self.last_clip_trim = 0.0        # 这一段裁掉了开头多少秒（= 入点之前的那些）
+        self._last_clip_end_at = 0.0     # 裁素材那一刻（= 素材的结尾时刻）
         self._current_scene = None       # 本地镜像的当前节目场景，避免频繁查询 OBS
         self.last_replay_round = None
         self.last_completed_round = None  # 最近打完的回合号（判断手里的素材是不是这一回合的）
@@ -1020,7 +987,7 @@ class ReplayDirector:
         # ★ 包装转场（stinger）会盖住回放片头：启动时报一次它有多长（只报一次）。
         _ = self._wrap_seconds()
 
-        # ★ 小键盘右键 = 保留片段：把"存到哪儿 / 文件名格式"写进插件。
+        # ★ 小键盘 6 = 保留片段：把"存到哪儿 / 文件名格式"写进插件。
         #   插件源码 :3070 `obs_properties_add_path(... OBS_PATH_DIRECTORY ...)` 的
         #   directory 默认是**未设置**的 → 直接按保存会生成相对路径，很可能落到
         #   OBS 工作目录里去，所以必须显式给一个目录。
@@ -1055,12 +1022,12 @@ class ReplayDirector:
                     self.obs.request("SetInputSettings",
                                      {"inputName": cfg["replay_item"],
                                       "inputSettings": patch, "overwrite": False})
-                    log(f"   『小键盘右键=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}"
+                    log(f"   『小键盘6=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}"
                         f"（来自{src}），文件名 {want_fmt}")
                 else:
-                    log(f"   『小键盘右键=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}")
+                    log(f"   『小键盘6=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}")
             except Exception as e:
-                log(f"   （设置保留片段失败，右键仍可用但可能存到默认位置: {e}）")
+                log(f"   （设置保留片段失败，小键盘 6 仍可用但可能存到默认位置: {e}）")
 
         self.expected_hold = min(
             float(cfg.get("record_max_seconds", 10.0)) / max(cfg["speed"], 0.05)
@@ -1106,11 +1073,11 @@ class ReplayDirector:
                 log(f"   （设置 next_scene 失败，会用引擎计时兜底: {e}）")
 
             # ★ 冲一次旧缓冲：改了 Duration 之后，滤镜里可能还留着"按旧上限攒的帧"
-            #   （实测：配置 10 秒但第一次定格拿到 12 秒）。启动时先定格一次把它倒掉，
-            #   之后每次定格的长度就都是按新配置算的了。
+            #   （实测：配置 10 秒但第一次裁出来是 12 秒）。启动时先放一次把它倒掉，
+            #   之后每次裁出来的长度就都是按新配置算的了。
             try:
                 self._hk("ReplaySource.Replay")
-                log("   已冲掉启动前的旧缓冲（第一次定格会略长，之后就是新上限了）")
+                log("   已冲掉启动前的旧缓冲（第一次裁片段会略长，之后就是新上限了）")
             except Exception:
                 pass
             log(f"   单段素材上限 {want_ms/1000:.0f} 秒，回放速度 {want_spd:.0f}%"
@@ -1123,56 +1090,14 @@ class ReplayDirector:
 
     # ---------------- 击杀事件：计划快照 ----------------
     def on_kill(self, sid, kill_count, round_no, name):
-        """检测到击杀。
+        """检测到击杀 —— 只打一行日志。
 
-        这里只负责"要不要为这一枪排一次定格"（`auto_replay` 开启时）。
-        回放入点**不再识别击杀**：用户 2026-10-06 决定删掉那套"决胜击杀/连杀"逻辑，
-        改成固定播最后 `play_tail_seconds` 秒。
-        （`auto_replay` 关掉时，下面"排一个延迟快照"的部分就不走了。）
+        ★ 2026-10-06 用户决定：**去掉所有自动定格**（回合结束自动抓、击杀后延迟抓都删了）。
+        所以这里不再排任何定时任务，素材只由 ← / → 两个键框出来。
         """
         cfg = self.cfg
         if kill_count and int(kill_count) >= 1:
             logv(cfg, f"   [击杀] {name or sid[:8]} 第 {kill_count} 杀")
-        if not cfg.get("auto_replay", False):
-            return
-        if not cfg.get("snapshot_on_kill", True):
-            return
-        if self.locked or self.replay_active:
-            return
-        if self.state_ref is not None and round_no != self.state_ref.live_round:
-            return
-        # 没在拍游戏（比如导播切到了数据看板）→ 滤镜里没有帧，快照也是空的
-        if self._current_scene and self._current_scene != cfg["live_scene"]:
-            logv(cfg, f"   [击杀] {name} 第 {kill_count} 杀，但当前在「{self._current_scene}」"
-                      f"不是直播场景，不快照")
-            return
-
-        first = (self._snapshot_round != round_no)
-        if first:
-            self._snapshot_round = round_no
-            self._snapshot_ok = False
-            self._snapshot_kills = 0
-        self._snapshot_kills += 1
-        delay = float(cfg.get("snapshot_delay", 1.2))
-        self._pending_snapshot_at = time.time() + delay
-        self._pending_round = round_no
-        tag = "⏱ 重排" if not first else "⏱"
-        log(f"   {tag} [击杀] 回合 {round_no}  {name} 拿到第 {kill_count} 杀"
-            f" → {delay:.1f}s 后快照回放素材")
-
-    def _fire_pending_snapshot(self):
-        self._pending_snapshot_at = 0.0
-        # ★ 只有"正在播回放"才不能定格（定格会去碰回放源，会把正在放的片子打断）。
-        #   **被锁（人工接管）不阻止定格** —— 否则你一旦接管，后面每个回合都不再攒素材，
-        #   按 Enter 只能反复播很早以前那一段（实测踩过一整场）。
-        if self.replay_active:
-            return
-        why = getattr(self, "_pending_reason", "") or "定时定格"
-        log(f"   📸 定格素材（{why}）")
-        self._pending_reason = ""
-        rnd = self._pending_round if self._pending_round is not None else self._snapshot_round
-        self._pending_round = None
-        self._load_replay(rnd)
 
     # ---------------- 人工接管 / 锁 ----------------
     def lock(self, reason):
@@ -1272,45 +1197,14 @@ class ReplayDirector:
         self.counters["rounds"] += 1
         self.last_completed_round = round_no
 
-        # ★ 不管自动回放开没开，都在"回合结束 +1 秒"处把素材定格。
-        #   这样素材结尾正好是回合结束后 1 秒，后面那些冻结时间/跑位全是废的，
-        #   不用你掐着表按 →。你只需要在想放的时候按一下【小键盘 Enter】。
-        if cfg.get("auto_capture_on_round_end", True):
-            delay = float(cfg.get("capture_after_round_end", 1.0))
-            # ★ 只有"正在播回放"才必须跳过（定格会去碰回放源，把正在放的片子打断）。
-            #   **被锁（人工接管）不跳过** —— 实测踩过：回放中 Astra 把场景切到
-            #   「数据看板」，引擎锁死自己，此后每个回合都不再定格，
-            #   按 Enter 只能反复播很早以前那一段。
-            if self.replay_active:
-                self.counters["skipped"] += 1
-                log(f"   （回合 {round_no} 结束，但正在回放，本回合不定格素材）")
-            elif (cfg.get("require_live_scene", True) and self._current_scene
-                  and self._current_scene != cfg["live_scene"]):
-                # ★ 现在 OBS 没在直播场景上（你或 Astra 切到数据看板/中场休息了）→
-                #   采集源没在渲染，滤镜缓冲是**饿的**，这时候定格只会拿到很短一段
-                #   甚至空片，还会把上一回合攒好的那段好素材冲掉。宁可不定格。
-                self.counters["skipped"] += 1
-                log(f"   （回合 {round_no} 结束，但 OBS 现在在「{self._current_scene}」"
-                    f"而不是「{cfg['live_scene']}」—— 游戏采集没在渲染，本回合不定格"
-                    f"（免得把上一段好素材冲掉）；想强行定格把 require_live_scene 关掉）")
-            elif time.time() - self._last_snapshot_at < float(cfg["record_max_seconds"]):
-                # 刚定格过（比如你手动按过 →），缓冲还没攒够，再定格只会拿到很短一段
-                self.counters["skipped"] += 1
-                log(f"   （回合 {round_no} 结束，但 {cfg['record_max_seconds']:.0f} 秒内刚定格过，跳过）")
-            else:
-                # ★ 这段素材属于"这个回合" —— 记下来，判断手里的素材是不是本回合的要用它。
-                #   放在独立的 _pending_round 里，不动 _snapshot_round：
-                #   _snapshot_round 表示"手里已经攒好的那段素材是哪个回合的"，
-                #   提前改掉会让上面那个"陈旧素材"判断失效。
-                self._pending_round = round_no
-                self._pending_snapshot_at = time.time() + delay
-                self._pending_reason = f"回合 {round_no} 结束 +{delay:.1f}s 自动定格"
-                log(f"⏱  回合 {round_no} 结束 → {delay:.1f} 秒后自动定格素材"
-                    f"（结尾就停在回合结束后 {delay:.1f} 秒，不留无用尾巴）")
-                if self.locked:
-                    log(f"   （注意：现在处于人工接管状态「{self.locked_reason}」，"
-                        f"但定格素材不受影响，照攒不误）")
-                log(f"   本回合评分 {score}（{', '.join(reasons) or '平淡'}）——仅供参考")
+        # ★ 2026-10-06 用户决定：**去掉所有自动定格**。
+        #   回合结束不再自动抓素材；素材完全由 ← / → 两个键框出来
+        #   （← 标入点 → 打完了按 → 当场把"入点 → 现在"裁成一段）。
+        #   如果你想每回合都自动播一遍刚打的片段，就把 auto_replay 打开
+        #   —— 但它现在只会播**你手动裁好的那一段**，不会再自己去碰缓冲。
+        log(f"   本回合评分 {score}（{', '.join(reasons) or '平淡'}）——仅供参考"
+            + ("　（想回放：按 ← 标入点 → 按 → 标出点 → 小键盘 Enter 播放）"
+               if not cfg.get("auto_replay", False) else ""))
 
         # 默认手动模式：不自动判断、不自动切画面。
         if not cfg.get("auto_replay", False):
@@ -1363,53 +1257,37 @@ class ReplayDirector:
         if self.replay_active:
             log("手动回放被拒绝：已经在回放中")
             return False
-        self._start_replay("手动触发", None, reuse_snapshot=True)
+        self._start_replay("手动触发", None)
         return True
 
     # ---------------- 回放生命周期 ----------------
-    def _start_replay(self, why, round_no, reuse_snapshot=False, hold_seconds=None):
+    def _start_replay(self, why, round_no=None, hold_seconds=None):
         """
-        把"决定用哪段素材 + 算播放时长 + 真正开播"整段放进 _capture_lock。
+        把"选哪段素材 + 算播放时长 + 真正开播"整段放进 _capture_lock。
 
         ⚠️ 为什么必须这样：
-          定格（_load_replay）要读 OBS 日志才能知道素材多长，要花 0.5~1 秒。
+          裁素材（_load_replay）要读 OBS 日志才能知道素材多长，要花 0.5~1 秒。
           如果这期间另一条线程（你按 Enter）开始播放，它会读到**上一次的旧长度**，
           于是按旧长度算播放时长 → 素材 12 秒却只播 7 秒，精彩的部分被砍掉。
           （这是实测到的真实故障，不是你操作问题。）
         """
         with self._capture_lock:
-            # --- 1. 决定用哪段素材；没有就现在定格（RLock，可重入）---
-            # ★ 只有"最近打完那个回合"的素材才算数。
-            #   旧写法 (reuse_snapshot and self._last_snapshot_at > 0) 只要历史上
-            #   成功定格过一次就永远算"有素材"，于是素材一断档，按 Enter 就会反复
-            #   播很早以前那一段（实测：都打到第 14 回合了，按 Enter 还在播第 11 回合的片子）。
-            stale = False
-            if (round_no is None and reuse_snapshot and self._snapshot_ok
-                    and self.last_completed_round is not None
-                    and self._snapshot_round is not None
-                    and self._snapshot_round != self.last_completed_round):
-                stale = True
-            have = self._snapshot_ok and (
-                (round_no is not None and self._snapshot_round == round_no)
-                or (reuse_snapshot and self._last_snapshot_at > 0 and not stale))
-            if have:
-                age = time.time() - self._last_snapshot_at
-                which = (f"第 {self._snapshot_round} 回合" if self._snapshot_round is not None
-                         else "刚才")
-                log(f"   ✔ 播放已定稿的素材（{which}，{age:.0f} 秒前存的，不再重新定格）")
-                self._pending_snapshot_at = 0.0
-                try:
-                    self._hk("ReplaySource.Last")
-                    log("   ✔ 已选中最新一段素材")
-                except Exception as e:
-                    logv(self.cfg, f"   （ReplaySource.Last 失败，忽略: {e}）")
-            else:
-                if stale:
-                    log(f"   ⚠️ 手里那段是第 {self._snapshot_round} 回合的，"
-                        f"第 {self.last_completed_round} 回合的没定稿成功 → 现在重新定格最近一段")
-                else:
-                    log("   ⚠️ 还没有定稿的素材 → 现在定格一次（取最近 N 秒）")
-                self._load_replay(round_no)
+            # --- 1. 用哪段素材：只有按 ← / → 手动裁出来的那一段 ---
+            #   ★ 2026-10-06 用户决定：引擎**不再按需定格**。手里没有裁好的片段就
+            #     明确让你先按 ← / →，而不是偷偷去抓一段你没框过的画面。
+            if not self._snapshot_ok:
+                log("   ⚠️ 还没有裁好的片段 —— 先按【←】标入点，打完了按【→】标出点，"
+                    "再按【小键盘 Enter】播放")
+                return
+            age = time.time() - self._last_snapshot_at
+            clip_len = self.last_clip_seconds
+            log(f"   ✔ 播放已裁好的片段（{age:.0f} 秒前裁的"
+                + (f"，{clip_len:.1f} 秒" if clip_len else "") + "）")
+            try:
+                self._hk("ReplaySource.Last")
+                log("   ✔ 已选中最新一段素材")
+            except Exception as e:
+                logv(self.cfg, f"   （ReplaySource.Last 失败，忽略: {e}）")
 
             # --- 2. 用**锁内读到的最新长度**算播放时长 ---
             clip = hold_seconds if hold_seconds is not None else self.last_clip_seconds
@@ -1443,7 +1321,6 @@ class ReplayDirector:
             self.replay_hard_deadline = self.replay_until + 10.0
             self.last_replay_round = round_no if round_no is not None else self.last_replay_round
             self.counters["replays"] += 1
-            self._pending_snapshot_at = 0.0   # 已经决定播了，取消还没到点的定格
             log(f"🎬 开始回放 —— {why}")
 
         # 时长体检：把预计占用时间和实测的"死时间窗口"比一比（只提醒前 3 次，避免刷屏）
@@ -1574,15 +1451,16 @@ class ReplayDirector:
 
     # ------------------------------------------------------------------
     def save_replay(self):
-        """小键盘右键：把当前那段素材另存成一个视频文件。
+        """小键盘 6：把当前那段素材另存成一个视频文件。
 
         插件源码依据（obs-replay-source 1.8.1 `replay-source.c`）：
           * 热键 `ReplaySource.Save`（:1249-1260）只把 saving_status 置为 STARTING，
             真正写盘在渲染线程的 `replay_save()`（:914-1056）里做。
           * `:916-919` 有个守卫：`video_frame_count == 0` 就直接返回 ——
-            **还没定稿过素材时按一下什么都不会发生**（安全，不会崩，也不会留半个文件）。
+            **还没裁过素材时按一下什么都不会发生**（安全，不会崩，也不会留半个文件）。
           * `:925` 存的是 `current_replay`（也就是你按 Enter 会播的那一段），
-            `:1024-1034` 会照旧应用 trim_front → 存出来的和回放里看到的一样。
+            `:1024-1034` 会照旧应用 trim_front → 存出来的和回放里看到的一样
+            （所以留档的视频也是"从你按 ← 那个入点开始"的）。
           * `:1010` 会往 OBS 日志写 `[replay_source: 'Replay Source'] start saving '<文件>'`，
             所以这里用"字节偏移读日志新行"的办法把完整路径回显给你。
         """
@@ -1590,12 +1468,12 @@ class ReplayDirector:
             mark = obs_log_mark()
             self._hk("ReplaySource.Save")
         except Exception as e:
-            log(f"❌ 【小键盘 → 保留片段】失败: {e}")
+            log(f"❌ 【小键盘 6 保留片段】失败: {e}")
             return
-        log("💾 【小键盘 → 保留片段】已让 OBS 把这段素材写成文件")
+        log("💾 【小键盘 6 保留片段】已让 OBS 把这段素材写成文件")
         if not self._snapshot_ok:
-            log("   ℹ️ 这次会话还没定格过素材。缓冲是插件自己在持续累积的，"
-                "所以通常照样能存（实测：没定格过也能存出 8.5MB 的片段）——")
+            log("   ℹ️ 这次会话还没裁过素材（没按过 →）。缓冲是插件自己在持续累积的，"
+                "所以通常照样能存（实测：没裁过也能存出 8.5MB 的片段）——")
             log("      下面没出现「✔ 已开始写盘」才是真没素材。")
         threading.Thread(target=self._report_save, args=(mark,), daemon=True).start()
 
@@ -1615,45 +1493,44 @@ class ReplayDirector:
                     return
         log("   ⚠️ 没在 OBS 日志里看到 'start saving' —— 这一按没有可存的素材。")
         log("      缓冲是插件自己在累积的，只有 OBS 刚启动 / 刚 Enable 过缓冲时才会是空的：")
-        log("      先按一下 → 抓一次（定格），再按小键盘 6 保留。")
+        log("      先按【←】标入点、【→】标出点裁一段出来，再按小键盘 6 保留。")
 
     # ------------------------------------------------------------------
+    # 素材入点：由 ← 手动标出来，不再是"固定秒数 / 识别击杀"
     # ------------------------------------------------------------------
-    def _tail_seconds(self):
+    def clip_skip_from_mark(self, mark_at):
         """
-        "回放固定只播最后多少秒"（`play_tail_seconds`）的**唯一解析处**。
+        算"素材入点该跳过开头多少秒" —— 入点就是导播按【←】的那一刻。
 
-        写 null / 不写 = 用默认值（`DEFAULTS["play_tail_seconds"]`，现在 6.0），
-        写 0 或负数 = 不裁，整段缓冲都播。
-        """
-        raw = self.cfg.get("play_tail_seconds", None)
-        if raw is None:
-            raw = DEFAULTS.get("play_tail_seconds", 6.0)
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return float(DEFAULTS.get("play_tail_seconds", 6.0))
+        ★ 2026-10-06 用户决定：素材完全由 ← / → 手动框选。
+          `←` 只记一个时刻；真正裁素材发生在按 `→` 的时候，所以这一步要回答：
+          "从按 ← 到现在，已经被滚出缓冲多少秒？"
 
-    def _entry_skip(self, round_no=None):
-        """
-        算"素材入点该跳过开头多少秒"，让回放**固定只播最后 `play_tail_seconds` 秒**。
+        模型（跟插件的滚动缓冲一致）：
+          * 缓冲里最多只有 `record_max_seconds` 秒，而且是**边打边滚**的；
+          * 每次裁素材（Load replay）会把缓冲**掏空**、从那一刻重新累积；
+          * 所以按 → 的那一刻，缓冲里能用的秒数 =
+                avail = min(record_max_seconds, now - 上次裁素材的时刻)
+          * 按 ← 到现在过了 elapsed 秒，那入点已经位于缓冲内的
+                avail - elapsed 位置 → 这就是要裁掉的开头长度。
 
-        ★ 2026-10-06 用户决定：**不要再"识别"击杀来算入点**。
-          原来是"算击杀在素材里第几秒、再往前留 lead 秒"，还叠了"多杀连杀按串头对齐"，
-          逻辑复杂、参数一堆，现场不好预期。现在只认一个数：
-
-              skip = record_max_seconds - play_tail_seconds
-
-          素材长度固定是 `record_max_seconds`（定格那一刻往前这么多秒），
-          所以"跳过前 record_max - tail 秒"= 正好播最后 tail 秒。
-          `play_tail_seconds <= 0` 或 >= 素材长度 → 不裁（整段播）。
+        入点已经滚出去了（elapsed > avail）→ 打警告并返回 0.0
+        （= 整段播；总比裁出一个空片段强。用户要求："提示先按 ←，不抓"的同理：
+         框不住就明说，不要偷偷给一段错的。）
         """
         cfg = self.cfg
         dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
-        tail = self._tail_seconds()
-        if tail <= 0.05:
+        now = time.time()
+        elapsed = max(0.0, now - float(mark_at or 0.0))
+        since_last = now - self._last_snapshot_at if self._last_snapshot_at else dur
+        avail = min(dur, max(0.0, since_last))
+        if elapsed > avail + 0.2:
+            log(f"   ⚠️ 入点已经滚出缓冲了（缓冲里只有 {avail:.1f} 秒，"
+                f"入点到出点隔了 {elapsed:.1f} 秒）→ 这一段从头播")
+            log(f"      下次注意：按完【←】要在 {dur:.0f} 秒内按【→】"
+                f"（缓冲最多留 {dur:.0f} 秒）。")
             return 0.0
-        return max(0.0, dur - tail)
+        return max(0.0, avail - elapsed)
 
     def _apply_start_delay(self, skip):
         """
@@ -1690,15 +1567,17 @@ class ReplayDirector:
                     log(f"   ✔ 入点通路自检通过：StartDelay={ms}ms（插件已确认）")
                 else:
                     log(f"   ⚠️ 入点通路自检失败：想写 StartDelay={ms}，读回 {got}"
-                        f" → 这次会从素材片头整段播（插件不认这个键；"
-                        f"把 play_tail_seconds 设成 0 即可不再尝试）")
+                        f" → 这次会从素材片头整段播（插件不认这个键）")
         except Exception as e:
             logv(cfg, f"   （设置入点失败，这次从片头播: {e}）")
 
-    def _load_replay(self, round_no=None):
+    def _load_replay(self, round_no=None, skip=0.0):
         """
         触发 Replay Source 的 "Load replay" 热键，把回放滤镜缓存的最近 N 秒
-        快照成一个可播放的回放。
+        快照成一段可播放的回放（= 按 → 标出点时"当场把入点到现在裁出来"）。
+
+        `skip` = 从这段素材开头再裁掉多少秒（入点之前那些），由
+        `clip_skip_from_mark()` 算好传进来；默认 0 = 整段播。
 
         实测结论（2026-10-05 在本机 OBS 32.2.2 + replay-source 上验证）：
           * obs-websocket 的 TriggerHotkeyByName **可以**触发源级热键，
@@ -1711,9 +1590,9 @@ class ReplayDirector:
         这种竞态（那会导致用旧的素材长度算播放时长，片子被腰斩）。
         """
         with self._capture_lock:
-            return self._load_replay_locked(round_no)
+            return self._load_replay_locked(round_no, skip)
 
-    def _load_replay_locked(self, round_no=None):
+    def _load_replay_locked(self, round_no=None, skip=0.0):
         """
         实测结论（2026-10-05 在本机 OBS 32.2.2 + replay-source 上验证）：
           * obs-websocket 的 TriggerHotkeyByName **可以**触发源级热键，
@@ -1730,16 +1609,15 @@ class ReplayDirector:
         gap = time.time() - self._last_load_replay
         need = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
         if self._last_load_replay and gap < need:
-            log(f"   ⚠️  距上次定格只有 {gap:.1f}s（需要 {need:.1f}s），"
+            log(f"   ⚠️  距上次裁片只有 {gap:.1f}s（需要 {need:.1f}s），"
                 f"这次素材会比上限短（{gap:.1f} 秒左右）。")
         try:
             mark = obs_log_mark()
-            # ★ 回放长度：先算出"跳过素材开头多少秒"，在触发定格**之前**写进插件。
-            #   （固定只播最后 play_tail_seconds 秒，不再识别击杀。）
-            skip = self._entry_skip(round_no)
-            tail = self._tail_seconds()
+            # ★ 入点：由 ← 标出来，skip = "入点之前那几秒"。在触发 Load replay
+            #   **之前**写进插件的 StartDelay（负值 = trim_front，真裁掉）。
+            skip = max(0.0, float(skip or 0.0))
             if skip > 0.05:
-                log(f"   ✂️ 固定只播最后 {tail:.1f} 秒（跳过素材开头 {skip:.1f} 秒）")
+                log(f"   ✂️ 从入点开始播（跳过素材开头 {skip:.1f} 秒）")
             else:
                 log("   ✂️ 不裁开头（整段缓冲都播）")
             self._apply_start_delay(skip)
@@ -1749,7 +1627,6 @@ class ReplayDirector:
             self._last_clip_end_at = self._last_load_replay
             self._last_snapshot_at = self._last_load_replay
             self._snapshot_ok = True
-            self._snapshot_round = round_no if round_no is not None else self._snapshot_round
             self.counters["snapshots"] = self.counters.get("snapshots", 0) + 1
             # 从 OBS 日志读**真实**的素材长度，不靠按键时间猜。
             # 用字节偏移读新行（不能用文本差异，见 obs_log_since 的注释）。
@@ -1771,21 +1648,21 @@ class ReplayDirector:
                 self.last_clip_seconds = playable
                 want = float(cfg.get("record_max_seconds", 10.0))
                 if applied > 0.05:
-                    log(f"   ✔ 素材已定稿（OBS 实测 {true_len:.2f} 秒，"
-                        f"跳过开头 {applied:.1f} 秒 → 可播 {playable:.2f} 秒）")
+                    log(f"   ✔ 素材已裁好（OBS 实测 {true_len:.2f} 秒，"
+                        f"从入点开始跳过开头 {applied:.1f} 秒 → 可播 {playable:.2f} 秒）")
                 else:
-                    log(f"   ✔ 素材已定稿（OBS 实测 {true_len:.2f} 秒）")
+                    log(f"   ✔ 素材已裁好（OBS 实测 {true_len:.2f} 秒，整段播）")
                     if skip > 0.05:
-                        log(f"      （本来想跳过 {skip:.1f} 秒，但片子只有 "
+                        log(f"      （本来想从 {skip:.1f} 秒处的入点开始，但片子只有 "
                             f"{true_len:.2f} 秒，比入点还短 → 从头播）")
                 if true_len < 1.0:
                     log(f"   ❌ 太短了！只有 {true_len:.2f} 秒，几乎看不到东西。")
                     log("      常见原因：")
-                    log("        1) 抓取前 OBS 不在 HUD 场景 → 游戏采集没在渲染，缓冲是空的")
+                    log("        1) 裁片前 OBS 不在 HUD 场景 → 游戏采集没在渲染，缓冲是空的")
                     log("        2) 游戏窗口被最小化 / 游戏没在出画面")
-                    log("        3) 刚刚抓过一次，缓冲才刚开始重新累积")
+                    log("        3) 刚刚裁过一次，缓冲才刚开始重新累积")
                 elif true_len < want * 0.6:
-                    log(f"   ⚠️ 比上限 {want:.0f} 秒短不少。如果这不是你刚抓过一次，")
+                    log(f"   ⚠️ 比上限 {want:.0f} 秒短不少。如果这不是你刚裁过一次，")
                     log("      检查一下游戏采集是否一直在出画面（别切走 HUD 场景）。")
             else:
                 self.last_clip_seconds = None
@@ -1830,12 +1707,8 @@ class ReplayDirector:
     def ticker(self):
         while not self._stop:
             time.sleep(0.05)
-            # 到点了就做"击杀瞬间"快照（回合还在打，画面继续直播，只是把素材存下来）
-            if self._pending_snapshot_at and time.time() >= self._pending_snapshot_at:
-                try:
-                    self._fire_pending_snapshot()
-                except Exception:
-                    log("!! 快照出错:\n" + traceback.format_exc())
+            # ★ 2026-10-06：这里原来有个"到点自动定格素材"的分支，已按用户要求整段删掉。
+            #   现在素材只由 ← / → 手动框选产生。
             # ★ 包装转场放完了 → 让回放真正开始播（见 _start_replay 里的定格第一帧）
             self._resume_after_wrap()
             if self.replay_active and time.time() >= self.replay_until:
@@ -1914,10 +1787,12 @@ class ReplayDirector:
             "replayActive": self.replay_active,
             "expectedHold": round(self.expected_hold, 2),
             "currentScene": self._current_scene,
-            "snapshotRound": self._snapshot_round,
-            "snapshotReady": self._snapshot_ok,
-            "snapshotAgoSec": (round(time.time() - self._last_snapshot_at, 1)
-                               if self._last_snapshot_at else None),
+            "clipReady": self._snapshot_ok,
+            "clipAgoSec": (round(time.time() - self._last_snapshot_at, 1)
+                           if self._last_snapshot_at else None),
+            # ★ 按 ← 标了入点之后，这里能看到"入点已经过去多久"（0 秒内按 → 效果最好）
+            "markInAgoSec": (round(time.time() - self.mark_in_at, 1)
+                             if self.mark_in_at else None),
             "counters": dict(self.counters),
         }
 
@@ -2069,110 +1944,71 @@ class KeyHook:
 
 class ManualController:
     """
-    导播手动的四段式即时回放：
+    导播手动的即时回放 —— **手动框选片段**（2026-10-06 用户定的新流程）：
 
-        ←  开始录制   清空缓冲，从此刻开始累积素材（Disable → Enable）
-        →  结束录制   把这一段定稿成一段可播放的回放（Load replay）
-        小键盘6        保留片段：把当前这段素材另存成文件（.flv，赛后能剪出去发）
-        小键盘Enter   切到「即时回放」场景播放；再按一次立刻切回直播
+        ←  左方向键     标记入点：记住"这一刻"
+        →  右方向键     标记出点：把"入点 → 现在"这一段裁成素材（结尾就停在出点）
+        小键盘6         保留片段：把当前这段素材另存成文件（.flv，赛后能剪出去发）
+        小键盘Enter     切到「即时回放」场景播放；再按一次立刻切回直播
 
-    为什么 ← 要先 Disable 再 Enable：
-        实测（2026-10-05）`ReplaySource.Enable` 会重建滤镜、**清空缓冲重新累积**。
-        所以"Disable + Enable"= 从此刻开始全新录一段，
-        按 → 时拿到的素材长度 ≈ 你按住的那段时间，而不是模糊的"倒回 N 秒"。
+    为什么出点一按就把片段裁出来（而不是等播放时才裁）：
+        Replay Source 的滚动缓冲只保留最近 `record_max_seconds` 秒，而且是**边打边滚**的。
+        等到按 Enter 才去取，入点早就滚出缓冲了。所以 → 必须**当场**
+        把"入点→现在"从缓冲里取出来裁好（Load replay + StartDelay 负值），
+        播放是之后按 Enter 的事。
+
+    ★ 2026-10-06 用户决定：**去掉所有自动定格**（回合结束自动抓、击杀后延迟抓都删了）。
+      引擎不会在你没按键的时候去碰回放缓冲 —— 攒素材只发生在按 → 的那一下。
     """
 
     def __init__(self, director):
         self.d = director
-        self.recording = False
-        self.rec_started = 0.0
-        self.clip_seconds = None
         self.hook = None
-        self.mode = (director.cfg.get("record_mode") or "retrospective").lower()
 
-    # ---------------- 事后抓取模式（默认，单人导播用这个）----------------
-    def on_capture(self):
-        """
-        只用这一个键：抓"最近 N 秒"。
-
-        为什么单人导播应该用这个：
-          它把"切视角"和"回放"在时间上彻底分开 ——
-          回合进行中你只管切视角，回合结束才按这一个键，
-          不用在交火那一瞬间腾出手。
-        """
+    # ---------------- ← 标记入点 ----------------
+    def on_mark_in(self):
+        """记住"这一刻"当入点。只是记一个时间戳，不碰 OBS。"""
         d = self.d
         if d.replay_active:
-            log("   （正在回放中，先按【小键盘 Enter】收掉再抓）")
+            log("   （正在回放中，先按【小键盘 Enter】收掉再标入点）")
             return
-        if self.recording:
-            log("   （上一段还在录，先按 → 结束它）")
+        d.mark_in_at = time.time()
+        log(f"⏺  【← 标记入点】{time.strftime('%H:%M:%S')} —— "
+            f"打完了按【→ 标记出点】把这一段裁出来")
+
+    # ---------------- → 标记出点（当场裁片段）----------------
+    def on_mark_out(self):
+        """把"入点 → 现在"裁成一段素材（结尾就停在出点）。"""
+        d = self.d
+        if d.replay_active:
+            log("   （正在回放中，先按【小键盘 Enter】收掉再标出点）")
             return
-        # 守卫：没在拍游戏 → 缓冲里没有帧，抓出来会是空的或极短
+        mark = d.mark_in_at
+        if not mark:
+            # ★ 用户要求：没标入点就按 → 时**提示先按 ←，不要去抓一段没框过的画面**。
+            log("⚠️  还没标入点：先按【←】标入点，打完了再按【→】标出点")
+            return
+        min_len = float(d.cfg.get("min_clip_seconds", 0.3))
+        elapsed = time.time() - mark
+        if elapsed < min_len:
+            log(f"⚠️  入点到出点只有 {elapsed:.2f} 秒，太短了（至少 {min_len:.1f} 秒）"
+                f"—— 入点还留着，再按一次【→】就把这一段裁出来")
+            return
+        # 守卫：没在拍游戏 → 缓冲里没有帧，裁出来会是空的或极短
         if d._current_scene and d._current_scene != d.cfg["live_scene"]:
             log(f"⚠️  现在 OBS 在「{d._current_scene}」而不是「{d.cfg['live_scene']}」——")
-            log("    游戏采集没在渲染，缓冲里可能没有画面。抓出来会很短甚至空的。")
-            log("    事后抓取要求你**一直在 HUD 场景**（那是唯一含游戏采集的场景）。")
-        log(f"⏺  【→ 抓取】把最近 {d.cfg.get('record_max_seconds')} 秒定稿为一段素材")
+            log("    游戏采集没在渲染，缓冲里可能没有画面，裁出来会很短甚至是空的。")
+        skip = d.clip_skip_from_mark(mark)
         try:
-            d._load_replay(None)
+            d._load_replay(None, skip=skip)
         except Exception as e:
-            log(f"❌ 抓取失败: {e}")
+            log(f"❌ 【→ 标记出点】裁片段失败: {e}")
             return
-        self.clip_seconds = getattr(d, "last_clip_seconds", None)
-        if self.clip_seconds:
-            log(f"⏹  素材就绪（OBS 实测 {self.clip_seconds:.2f} 秒）")
-        if d.cfg.get("auto_play_after_capture", True):
-            delay = float(d.cfg.get("auto_play_delay", 0.5))
-            log(f"    {delay:.1f} 秒后自动切画面播放（想手动播就把 "
-                f"auto_play_after_capture 改成 false）")
-            time.sleep(delay)
-            self.on_play()
-        else:
-            log("    → 按【小键盘 Enter】切画面播放")
-
-    # ---------------- 精确框选模式（← 开始 / → 结束）----------------
-    def on_record_start(self):
-        d = self.d
-        if self.mode != "bracket":
-            log("ℹ️  当前是【事后抓取】模式，← 键没启用。")
-            log("    回合结束按一次 → 就抓最近 N 秒；想用精确框选，"
-                "把 config.json 的 record_mode 改成 \"bracket\"。")
-            return
-        try:
-            d._hk("ReplaySource.Disable")     # 清空
-            time.sleep(0.05)
-            d._hk("ReplaySource.Enable")      # 从此刻重新累积
-        except Exception as e:
-            log(f"❌ 【← 开始录制】失败: {e}")
-            return
-        self.recording = True
-        self.rec_started = time.time()
-        self.clip_seconds = None
-        d.last_clip_seconds = None            # 别把上一段的长度带过来
-        log("⏺  【← 开始录制】已清空缓冲，从这一刻开始录")
-
-    def on_record_stop(self):
-        # 事后抓取模式下，→ 就是"抓取"这一个动作
-        if self.mode != "bracket":
-            return self.on_capture()
-        d = self.d
-        dur = (time.time() - self.rec_started) if self.recording else None
-        if dur is None:
-            log("⏹  【→ 结束录制】⚠️ 你还没按过 ←！")
-            log("    现在取的是插件的滚动缓冲（最近 N 秒），很可能不是你要的那一段。")
-            log("    正确用法：打起来时先按 ←，打完了再按 →。")
-        # ⚠️ 必须走 _load_replay()，不能直接调热键：
-        #    否则引擎不知道自己已经有素材了，你在按 Enter 播放时它会**再快照一次**，
-        #    而插件只留 1 个回放 → 把刚录好的那一段覆盖成"从 → 到 Enter"的垃圾画面。
-        try:
-            d._load_replay(None)
-        except Exception as e:
-            log(f"❌ 【→ 结束录制】失败: {e}")
-            return
-        self.recording = False
-        # 用 OBS 日志里读到的**真实**素材长度来算播放时长
-        self.clip_seconds = getattr(d, "last_clip_seconds", None)
-        log("⏹  【→ 结束录制】素材已定稿")
+        d.mark_in_at = 0.0                      # 这一段用完了，下次重新标
+        got = getattr(d, "last_clip_seconds", None)
+        log(f"⏹  【→ 标记出点】片段已裁好：入点到现在 {elapsed:.1f} 秒"
+            + (f"，可播 {got:.1f} 秒" if got else ""))
+        log("    → 按【小键盘 Enter】切画面播放；想留档再按【小键盘 6】存成文件")
 
     def on_play(self):
         d = self.d
@@ -2180,11 +2016,14 @@ class ManualController:
             log("⏏  【小键盘 Enter】立刻切回直播")
             d._end_replay("手动切回")
             return
+        if not d._snapshot_ok:
+            log("⚠️  还没有裁好的片段 —— 先按【←】标入点，打完了按【→】标出点，再按播放")
+            return
         # 不传长度：让引擎在锁内读**最新**的素材长度，避免用到旧的
         log("▶  【小键盘 Enter】切画面播放")
-        d._start_replay("手动播放", None, reuse_snapshot=True)
+        d._start_replay("手动播放", None)
 
-    # ---------------- 小键盘右键：保留片段 ----------------
+    # ---------------- 小键盘 6：保留片段 ----------------
     def on_save(self):
         """把当前那段素材另存成文件（赛后能剪出去发）。"""
         self.d.save_replay()
@@ -2195,7 +2034,7 @@ def numlock_on():
 
     ★ 为什么要在意：小键盘 6 在 **NumLock 关**的时候，Windows 发出的就是
       "右方向键 + 扩展位"，和键盘右边那个 → 完全一样（钩子层面区分不开，
-      scancode 都是 0x4D）—— 于是"小键盘右键=保留片段"会被当成"→ 抓取"。
+      scancode 都是 0x4D）—— 于是"小键盘 6 = 保留片段"会被当成"→ 标记出点"。
       NumLock 亮着时它是 VK_NUMPAD6(0x66)，两者就能各干各的。
     """
     try:
@@ -2207,27 +2046,21 @@ def numlock_on():
 
 def make_manual_hook(controller, debounce=0.5):
     """
-    键位是分开绑定的，按模式走：
+    键位绑定（2026-10-06 起：手动框选片段，四个键）：
 
-      事后抓取(rétrospective，默认)  →  两个键：
-          →  抓取最近 N 秒（抓到后可选自动播）
-          小键盘 6  保留片段（把当前这段素材另存成文件，赛后能剪出去发）
-          小键盘 Enter  切画面播放 / 再按一次切回
-
-      精确框选(bracket)  →  四个键：
-          ←  开始录制    →  结束录制
-          小键盘 6  保留片段    小键盘 Enter  播放
-
-    两种模式下 ← 都绑上，但事后抓取模式里按它只会打印一句提示，不做任何事。
+       ←  左方向键     标记入点
+       →  右方向键     标记出点（当场把"入点 → 现在"裁成一段素材）
+       小键盘 6        保留片段（把当前这段素材另存成文件，赛后能剪出去发）
+       小键盘 Enter    切画面播放 / 再按一次切回
 
     ★ 为什么"小键盘 6"没有连 `(VK_RIGHT, True)` 一起绑：
       方向键在 Windows 里**本身就带扩展位**（E0 前缀），NumLock 关掉时小键盘 6
       发出来的也是 `(VK_RIGHT, ext=True)`、scancode 同样是 0x4D —— 两者在底层
       完全同码，钩子上区分不开。所以这里只认 NumLock 亮着时的 `VK_NUMPAD6`，
-      免得把真正的 → 键劫持成"保留片段"（→ 是抓取键）。NumLock 没开时启动会提醒。
+      免得把真正的 → 键劫持成"保留片段"（→ 是标出点键）。NumLock 没开时启动会提醒。
     """
-    return KeyHook({VK_LEFT: controller.on_record_start,
-                    VK_RIGHT: controller.on_record_stop,
+    return KeyHook({VK_LEFT: controller.on_mark_in,
+                    VK_RIGHT: controller.on_mark_out,
                     VK_NUMPAD6: controller.on_save,
                     (VK_RETURN, True): controller.on_play},
                    debounce=debounce)
@@ -3538,18 +3371,18 @@ class App:
     def unlock(self, r): self.director.unlock(r)
     def manual_replay(self): return self.director.manual_replay()
 
-    def record_start(self):
+    def mark_in(self):
         if not self.controller:
-            log("（没有键盘控制器，忽略 record_start）")
+            log("（没有键盘控制器，忽略 mark_in）")
             return False
-        self.controller.on_record_start()
+        self.controller.on_mark_in()
         return True
 
-    def record_stop(self):
+    def mark_out(self):
         if not self.controller:
-            log("（没有键盘控制器，忽略 record_stop）")
+            log("（没有键盘控制器，忽略 mark_out）")
             return False
-        self.controller.on_record_stop()
+        self.controller.on_mark_out()
         return True
 
     def start_web_server(self):
@@ -3598,7 +3431,7 @@ class App:
         t.start()
         log(f"GSI 监听: http://{self.cfg['gsi_host']}:{self.cfg['gsi_port']}{self.cfg['gsi_path']}")
         log(f"控制端点: /control/status | /lock | /unlock | /replay"
-            f" | /record_start | /record_stop")
+            f" | /mark_in | /mark_out")
 
 
 # ---------------------------------------------------------------------------
@@ -3801,10 +3634,10 @@ def run_test_load_replay(cfg):
 def run_test_keys(cfg):
     log("=== 热键测试 ===")
     log("请依次按这四个键，窗口里会实时打印。按 Ctrl+C 结束。")
-    log("   ←  左方向键")
-    log("   →  右方向键")
+    log("   ←  左方向键（标记入点）")
+    log("   →  右方向键（标记出点：把入点到现在裁成一段）")
     log("   小键盘 6（保留片段）")
-    log("   小键盘 Enter（不是主键盘那个大的 Enter）")
+    log("   小键盘 Enter（切画面播放；不是主键盘那个大的 Enter）")
     nl = numlock_on()
     if nl is None:
         log("   （读不到 NumLock 状态）")
@@ -3812,7 +3645,7 @@ def run_test_keys(cfg):
         log("   NumLock：✅ 亮着 —— 小键盘 6 和 → 是两个不同的键，互不干扰")
     else:
         log("   NumLock：❌ 关着 —— 现在小键盘 6 和 → 发的是同一个按键，"
-            "两个都会走「→ 抓取」。请按一下 NumLock 让灯亮起来再测。")
+            "两个都会走「→ 标记出点」。请按一下 NumLock 让灯亮起来再测。")
 
     def mk(label, is_target):
         def f():
@@ -3973,7 +3806,6 @@ def run_simulate(cfg):
     log("=== 仿真模式：用伪造的 GSI 数据验证决策逻辑（不连 OBS、不连 CS2）===")
     cfg = dict(cfg)
     cfg["min_score"] = 25
-    cfg["snapshot_delay"] = 0.4     # 仿真里压缩时间，好在回合结束前把快照做出来
     cfg["verbose"] = True
 
     obs = NullObsClient(scenes=[cfg["live_scene"], cfg["replay_scene"], "bp"],
@@ -4016,6 +3848,30 @@ def run_simulate(cfg):
         for payload, delay in build_sim_round(rno, kills, plant, defuse, clutch, seq):
             app.on_gsi(payload)
             time.sleep(delay)
+
+    # --- 手动框选流程：← 标入点 / → 标出点 / 小键盘 Enter 播放 ---
+    #   （2026-10-06 起引擎不再自动定格，素材只能这样框出来）
+    log("")
+    log("──────── 手动框选：← 入点 → 出点 → 小键盘 Enter 播放 ────────")
+    ctl = ManualController(app.director)
+    log("  （没标入点就按 → ：应被拒绝，不会裁片）")
+    ctl.on_mark_out()
+    log(f"  snapshots = {app.director.counters.get('snapshots', 0)}  (期望 0)")
+    log("  （← 标入点，过 0.6 秒再按 → ：应裁出一段）")
+    ctl.on_mark_in()
+    time.sleep(0.6)
+    ctl.on_mark_out()
+    log(f"  snapshots = {app.director.counters.get('snapshots', 0)}  (期望 1)")
+    log("  （手抖：刚标完入点就按 → ：应被拒绝，入点还留着）")
+    ctl.on_mark_in()
+    ctl.on_mark_out()
+    log(f"  snapshots = {app.director.counters.get('snapshots', 0)}  (期望仍是 1)")
+    app.director.mark_in_at = 0.0
+    log("  （播放刚裁好的那一段）")
+    ctl.on_play()
+    log(f"  回放中? {app.director.replay_active}  (期望 True)")
+    app.director._end_replay("仿真收尾")
+    log(f"  回放中? {app.director.replay_active}  (期望 False)")
 
     # --- 安全性测试：回放期间回合开打，必须强制让位 ---
     log("")
@@ -4120,40 +3976,33 @@ def run_live(cfg, manual_only=False):
         log("  同时它会把每个回合的判定结果打进日志，方便你对比")
         log("  「引擎觉得该放的」和「你自己觉得该放的」是否一致。")
 
-    # ★ 手动键盘控制（默认工作方式）
+    # ★ 手动键盘控制（唯一的工作方式：手动框选片段）
     ctl = None
     if cfg.get("manual_keys", True) and not cfg["dry_run"]:
         ctl = ManualController(app.director)
-        app.controller = ctl          # ← 让 HTTP 端点 /control/record_start|stop 也能走同一套逻辑
+        app.controller = ctl          # 让 HTTP 端点 /control/mark_in|mark_out 也走同一套逻辑
         hook = make_manual_hook(ctl, debounce=float(cfg.get("key_debounce", 0.4)))
         if hook.start():
             ctl.hook = hook
             log("")
             log("⌨  全局热键已启用（只读监听，不拦截按键）：")
-            if (cfg.get("record_mode") or "").lower() == "bracket":
-                log("      模式：精确框选（bracket）")
-                log("      ←  左方向键      开始录制（清空缓冲，从此刻起录）")
-                log("      →  右方向键      结束录制（把这一段定稿）")
-            else:
-                log("      模式：事后抓取（retrospective）—— 单人导播推荐")
-                log(f"      →  右方向键      抓取最近 {cfg.get('record_max_seconds')} 秒"
-                    f"为一段素材   ★ 你平时只需要按这一个")
-                if cfg.get("auto_play_after_capture", True):
-                    log("                      （抓到后会自动切画面播放）")
-                log("      ←  左方向键      此模式下未启用（想精确框选请把 config.json 的")
-                log("                       record_mode 改成 \"bracket\"）")
+            log("      ←  左方向键      标记入点（记住这一刻）")
+            log(f"      →  右方向键      标记出点：把「入点 → 现在」裁成一段素材"
+                f"（缓冲最长 {cfg.get('record_max_seconds')} 秒，所以要在 "
+                f"{cfg.get('record_max_seconds')} 秒内按）")
             log("      小键盘 Enter     切到「即时回放」播放；再按一次立刻切回")
             if cfg.get("save_replay_key", True):
                 log("      小键盘 6         保留片段（把当前这段素材另存成文件）"
                     f" → {cfg.get('save_dir') or 'OBS 录制目录'}")
+            log("      ★ 引擎不做任何自动定格：不按 → 就没有新素材。")
             nl = numlock_on()
             if nl is False:
                 log("      ⚠️ NumLock 灯是灭的：小键盘 6 和 → 发的是同一个按键，"
-                    "现在按小键盘 6 只会当抓取。")
+                    "现在按小键盘 6 只会当「标记出点」。")
                 log("         想让「保留片段」生效，请按一下 NumLock 让灯亮起来。")
         else:
             log(f"⚠️  全局热键安装失败：{hook.error}")
-            log("    可以用浏览器控制端点代替：/control/record_start /record_stop /replay")
+            log("    可以用浏览器控制端点代替：/control/mark_in /mark_out /replay")
 
     app.start_gsi_server()
     app.start_web_server()
@@ -4162,7 +4011,8 @@ def run_live(cfg, manual_only=False):
 
     log("")
     log("就绪。把 gamestate_integration_director.cfg 放进 CS2 的 game/csgo/cfg/ 目录，")
-    log("然后启动 CS2 观战即可。控制端点: /control/status | /lock | /unlock | /replay")
+    log("然后启动 CS2 观战即可。控制端点: /control/status | /lock | /unlock | /replay"
+        " | /mark_in | /mark_out")
     log("按 Ctrl+C 退出。")
     try:
         while True:
