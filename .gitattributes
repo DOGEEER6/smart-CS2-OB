@@ -1,0 +1,3 @@
+# 关掉 git 的行尾自动转换（core.autocrlf=true 会让下次 checkout 把整份 .md 翻成 CRLF → 全文件 diff）。
+# 这个仓库里有意保持：.py / .cmd 为 CRLF，.md 为 LF。改了这里等于给自己埋 diff 地雷。
+* -text
