@@ -13,6 +13,8 @@ dist/
 # ---------------------------------------------------------------
 config.json
 config.json.bak
+# 改配置前留的备份（config.json.before-entrykeys.bak 这种）
+config.json.*
 viewer_token.txt
 *.log
 

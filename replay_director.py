@@ -201,6 +201,17 @@ DEFAULTS = {
     "snapshot_delay": 1.2,            # 击杀后等几秒再快照，让击杀落在片子中间而不是末尾
     "retrieve_delay_ms": 0,           # 同时写入插件的 "Load Delay"（一般保持 0）
 
+    # ★ 入点对齐：把回放的**开头**从"回合最后那几秒的跑位/垃圾时间"挪到
+    #   "决胜击杀之前几秒"。
+    #   做法：定格前把 Replay Source 的 StartDelay 写成负值（= 从片段开头跳过这么久），
+    #   插件在 replay_retrieve() 里会把它变成 trim_front，播放时直接跳到入点
+    #   —— 是真裁掉，不是快进。
+    #   为什么需要：回合结束那一刻往前 10 秒里，往往前 7 秒都是死了的人在跑图，
+    #   真正决定回合的那一枪在最后 2 秒。
+    "entry_align_to_kill": True,      # 按"本回合最后一次击杀"对齐入点
+    "entry_lead_seconds": 2.0,        # 入点留在击杀前几秒（0 = 正好从击杀开始）
+    "entry_min_keep_seconds": 2.5,    # 不管怎么对齐，至少留这么多秒可播
+
     # --- 和 Astra 的协作（重要）---
     # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
     #   require_live_scene : 只有当直播场景正好是 live_scene 时才插回放。
@@ -210,6 +221,12 @@ DEFAULTS = {
     #                        都会把引擎永久锁死。人工接管请用 /control/lock。
     "require_live_scene": True,
     "lock_on_manual_scene": False,
+    # ★ 人工接管的锁有有效期：一旦锁上，过了这么久就自动交还给引擎。
+    #   为什么必须有：实测踩过 —— 回放中 Astra 按阶段把场景切到「数据看板」，
+    #   引擎把它当成"人工接管"锁死，**整场比赛再没解锁**，
+    #   于是后面每个回合结束都不再定格素材，你按 Enter 只能播到很早以前那一段。
+    #   0 = 永不过期（不建议）。
+    "manual_lock_seconds": 45.0,
 
     # --- 其它 ---
     "dry_run": False,
@@ -867,10 +884,24 @@ class ReplayDirector:
         self._last_snapshot_at = 0.0     # 上次快照的时刻（手动回放会复用 20 秒内的）
         self._pending_snapshot_at = 0.0  # 计划在什么时刻做快照（击杀后延迟 / 回合结束后）
         self._pending_reason = ""        # 这次定时定格是为了什么（写日志用）
+        self._pending_round = None       # 这次定时定格属于哪个回合（入点对齐要用）
         self._snapshot_kills = 0         # 本回合已快照的击杀数（用于日志）
-        self.last_clip_seconds = None    # 最近一次快照的**真实**长度（从 OBS 日志读）
+        self.last_clip_seconds = None    # 最近一次快照的**可播**长度（已扣掉入点裁掉的部分）
+        self.last_clip_raw_seconds = None  # 插件报的原始长度（未裁）
+        self.last_clip_trim = 0.0        # 这一段裁掉了开头多少秒（入点对齐）
+        self._last_clip_end_at = 0.0     # 定格那一刻（= 素材的结尾时刻）
         self._current_scene = None       # 本地镜像的当前节目场景，避免频繁查询 OBS
         self.last_replay_round = None
+        self.last_completed_round = None  # 最近打完的回合号（判断手里的素材是不是这一回合的）
+        # 入点对齐用的"本回合最后一次击杀"
+        self._last_kill_at = 0.0
+        self._last_kill_round = None
+        self._last_kill_name = ""
+        self._start_delay_checked = False  # 是否已经验证过 StartDelay 能写进插件
+        # 人工接管锁的自动过期
+        self._locked_at = 0.0
+        # 进回放之前人在哪个场景（回放结束后切回这里，而不是死板地切回 live_scene）
+        self._scene_before_replay = None
         self.expected_hold = 0.0
         self.manual_replay_pending = False
         self._expected_scene = None      # 兼容旧逻辑
@@ -1010,8 +1041,18 @@ class ReplayDirector:
 
     # ---------------- 击杀事件：计划快照 ----------------
     def on_kill(self, sid, kill_count, round_no, name):
-        """（只在自动模式下用）检测到击杀，排一个延迟快照。"""
+        """检测到击杀。
+
+        ★ 不管自动回放开没开，**都要记下击杀时刻** —— 入点对齐
+          （把回放开头挪到决胜击杀之前）靠的就是"这回合最后一枪是什么时候"。
+        （`auto_replay` 关掉时，下面"排一个延迟快照"的部分就不走了。）
+        """
         cfg = self.cfg
+        now = time.time()
+        if kill_count and int(kill_count) >= 1:
+            self._last_kill_at = now
+            self._last_kill_round = round_no
+            self._last_kill_name = name or ""
         if not cfg.get("auto_replay", False):
             return
         if not cfg.get("snapshot_on_kill", True):
@@ -1034,18 +1075,24 @@ class ReplayDirector:
         self._snapshot_kills += 1
         delay = float(cfg.get("snapshot_delay", 1.2))
         self._pending_snapshot_at = time.time() + delay
+        self._pending_round = round_no
         tag = "⏱ 重排" if not first else "⏱"
         log(f"   {tag} [击杀] 回合 {round_no}  {name} 拿到第 {kill_count} 杀"
             f" → {delay:.1f}s 后快照回放素材")
 
     def _fire_pending_snapshot(self):
         self._pending_snapshot_at = 0.0
-        if self.replay_active or self.locked:
+        # ★ 只有"正在播回放"才不能定格（定格会去碰回放源，会把正在放的片子打断）。
+        #   **被锁（人工接管）不阻止定格** —— 否则你一旦接管，后面每个回合都不再攒素材，
+        #   按 Enter 只能反复播很早以前那一段（实测踩过一整场）。
+        if self.replay_active:
             return
         why = getattr(self, "_pending_reason", "") or "定时定格"
         log(f"   📸 定格素材（{why}）")
         self._pending_reason = ""
-        self._load_replay(self._snapshot_round)
+        rnd = self._pending_round if self._pending_round is not None else self._snapshot_round
+        self._pending_round = None
+        self._load_replay(rnd)
 
     # ---------------- 人工接管 / 锁 ----------------
     def lock(self, reason):
@@ -1054,6 +1101,7 @@ class ReplayDirector:
                 log(f"🔒 已锁定自动导播（原因：{reason}）—— 手动接管优先")
             self.locked = True
             self.locked_reason = reason
+            self._locked_at = time.time()
 
     def unlock(self, reason):
         with self.lock_state:
@@ -1061,6 +1109,29 @@ class ReplayDirector:
                 log(f"🔓 已解锁自动导播（原因：{reason}）")
             self.locked = False
             self.locked_reason = ""
+            self._locked_at = 0.0
+
+    def _return_scene(self):
+        """回放结束后该回到哪个场景。
+
+        默认 live_scene；但如果是你（或 Astra）在「数据看板」之类的场景上按了
+        播放键，就在播完之后切回那个场景，而不是硬切回 HUD
+        —— 硬切会让画面在赛间乱跳一下。
+        """
+        return self._scene_before_replay or self.cfg["live_scene"]
+
+    def _set_plugin_next_scene(self, scene):
+        """把"播完自动切到哪个场景"写进插件（负值/空值会让插件不切）。"""
+        try:
+            _, s = self.obs.input_settings(self.cfg["replay_item"])
+            if s.get("next_scene") == scene:
+                return
+            self.obs.request("SetInputSettings",
+                             {"inputName": self.cfg["replay_item"],
+                              "inputSettings": {"next_scene": scene},
+                              "overlay": True, "overwrite": False})
+        except Exception as e:
+            logv(self.cfg, f"   （设置播完切回场景失败，用引擎计时兜底: {e}）")
 
     def on_obs_event(self, event_type, data):
         """
@@ -1081,11 +1152,12 @@ class ReplayDirector:
         self._current_scene = scene
         now = time.time()
         # ★ 插件按 next_scene 自己切回来了（片子播完的那一帧）——这是我们要的收尾方式。
-        #   识别方式：从「即时回放」回到「直播场景」的转变，而且不是我们发起的
+        #   识别方式：从「即时回放」回到**进回放之前那个场景**的转变，而且不是我们发起的
         #   （我们自己切的时候 replay_active 已经先置 False 了，所以不会误判）。
-        if (self.replay_active and scene == self.cfg["live_scene"]
-                and prev == self.cfg["replay_scene"]):
-            self._end_replay("素材播完（插件按 next_scene 自动切回）")
+        #   注意这里不能写死 live_scene：你可能是在「数据看板」上按的播放键。
+        if (self.replay_active and prev == self.cfg["replay_scene"]
+                and scene == self._return_scene()):
+            self._end_replay(f"素材播完（插件按 next_scene 切回「{scene}」）")
             return
         if scene in self._self_scenes and now <= self._self_scene_until:
             logv(self.cfg, f"   （场景事件 {scene} 由引擎自己触发，忽略）")
@@ -1093,7 +1165,9 @@ class ReplayDirector:
         # 回放中被人切走 —— 无疑义的人工接管
         if self.replay_active and scene != self.cfg["replay_scene"]:
             self.lock(f"回放中被切到「{scene}」")
-            self._end_replay("人工接管")
+            # ★ 不要再切一次场景！人家（你或者 Astra）已经把画面切到别处了，
+            #   我们再切回 HUD 就是两个程序互相抢画面。只把回放源收起来就好。
+            self._end_replay("人工接管", switch_back=False)
             return
         if self.cfg.get("lock_on_manual_scene"):
             self.lock(f"检测到切到「{scene}」")
@@ -1105,6 +1179,9 @@ class ReplayDirector:
         # 有效期覆盖整次回放 + 余量，期间落在这两个场景上的事件都算自己的
         self._self_scene_until = time.time() + self.expected_hold + 8.0
         self._expected_scene = (scene, time.time() + 5.0)
+        # ★ 凡是**我们自己**切过去的场景，都记成"自己的场景"。
+        #   否则"播完切回数据看板"这个动作会落进"回放中被人切走"分支 → 误锁自己。
+        self._self_scenes.add(scene)
         self._current_scene = scene
         log(f"   [OBS] 切到场景「{scene}」")
         self.obs.set_scene(scene)
@@ -1113,24 +1190,46 @@ class ReplayDirector:
     def on_round_end(self, round_no, stats, score, reasons):
         cfg = self.cfg
         self.counters["rounds"] += 1
+        self.last_completed_round = round_no
 
         # ★ 不管自动回放开没开，都在"回合结束 +1 秒"处把素材定格。
         #   这样素材结尾正好是回合结束后 1 秒，后面那些冻结时间/跑位全是废的，
         #   不用你掐着表按 →。你只需要在想放的时候按一下【小键盘 Enter】。
         if cfg.get("auto_capture_on_round_end", True):
             delay = float(cfg.get("capture_after_round_end", 1.0))
-            if self.replay_active or self.locked:
+            # ★ 只有"正在播回放"才必须跳过（定格会去碰回放源，把正在放的片子打断）。
+            #   **被锁（人工接管）不跳过** —— 实测踩过：回放中 Astra 把场景切到
+            #   「数据看板」，引擎锁死自己，此后每个回合都不再定格，
+            #   按 Enter 只能反复播很早以前那一段。
+            if self.replay_active:
                 self.counters["skipped"] += 1
-                log(f"   （回合 {round_no} 结束，但正在回放/已锁定，本回合不定格素材）")
+                log(f"   （回合 {round_no} 结束，但正在回放，本回合不定格素材）")
+            elif (cfg.get("require_live_scene", True) and self._current_scene
+                  and self._current_scene != cfg["live_scene"]):
+                # ★ 现在 OBS 没在直播场景上（你或 Astra 切到数据看板/中场休息了）→
+                #   采集源没在渲染，滤镜缓冲是**饿的**，这时候定格只会拿到很短一段
+                #   甚至空片，还会把上一回合攒好的那段好素材冲掉。宁可不定格。
+                self.counters["skipped"] += 1
+                log(f"   （回合 {round_no} 结束，但 OBS 现在在「{self._current_scene}」"
+                    f"而不是「{cfg['live_scene']}」—— 游戏采集没在渲染，本回合不定格"
+                    f"（免得把上一段好素材冲掉）；想强行定格把 require_live_scene 关掉）")
             elif time.time() - self._last_snapshot_at < float(cfg["record_max_seconds"]):
                 # 刚定格过（比如你手动按过 →），缓冲还没攒够，再定格只会拿到很短一段
                 self.counters["skipped"] += 1
                 log(f"   （回合 {round_no} 结束，但 {cfg['record_max_seconds']:.0f} 秒内刚定格过，跳过）")
             else:
+                # ★ 这段素材属于"这个回合" —— 记下来，入点对齐要靠它。
+                #   放在独立的 _pending_round 里，不动 _snapshot_round：
+                #   _snapshot_round 表示"手里已经攒好的那段素材是哪个回合的"，
+                #   提前改掉会让上面那个"陈旧素材"判断失效。
+                self._pending_round = round_no
                 self._pending_snapshot_at = time.time() + delay
                 self._pending_reason = f"回合 {round_no} 结束 +{delay:.1f}s 自动定格"
                 log(f"⏱  回合 {round_no} 结束 → {delay:.1f} 秒后自动定格素材"
                     f"（结尾就停在回合结束后 {delay:.1f} 秒，不留无用尾巴）")
+                if self.locked:
+                    log(f"   （注意：现在处于人工接管状态「{self.locked_reason}」，"
+                        f"但定格素材不受影响，照攒不误）")
                 log(f"   本回合评分 {score}（{', '.join(reasons) or '平淡'}）——仅供参考")
 
         # 默认手动模式：不自动判断、不自动切画面。
@@ -1200,12 +1299,24 @@ class ReplayDirector:
         """
         with self._capture_lock:
             # --- 1. 决定用哪段素材；没有就现在定格（RLock，可重入）---
+            # ★ 只有"最近打完那个回合"的素材才算数。
+            #   旧写法 (reuse_snapshot and self._last_snapshot_at > 0) 只要历史上
+            #   成功定格过一次就永远算"有素材"，于是素材一断档，按 Enter 就会反复
+            #   播很早以前那一段（实测：都打到第 14 回合了，按 Enter 还在播第 11 回合的片子）。
+            stale = False
+            if (round_no is None and reuse_snapshot and self._snapshot_ok
+                    and self.last_completed_round is not None
+                    and self._snapshot_round is not None
+                    and self._snapshot_round != self.last_completed_round):
+                stale = True
             have = self._snapshot_ok and (
                 (round_no is not None and self._snapshot_round == round_no)
-                or (reuse_snapshot and self._last_snapshot_at > 0))
+                or (reuse_snapshot and self._last_snapshot_at > 0 and not stale))
             if have:
                 age = time.time() - self._last_snapshot_at
-                log(f"   ✔ 播放已定稿的素材（{age:.0f} 秒前存的，不再重新定格）")
+                which = (f"第 {self._snapshot_round} 回合" if self._snapshot_round is not None
+                         else "刚才")
+                log(f"   ✔ 播放已定稿的素材（{which}，{age:.0f} 秒前存的，不再重新定格）")
                 self._pending_snapshot_at = 0.0
                 try:
                     self._hk("ReplaySource.Last")
@@ -1213,12 +1324,21 @@ class ReplayDirector:
                 except Exception as e:
                     logv(self.cfg, f"   （ReplaySource.Last 失败，忽略: {e}）")
             else:
-                log("   ⚠️ 还没有定稿的素材 → 现在定格一次（取最近 N 秒）")
+                if stale:
+                    log(f"   ⚠️ 手里那段是第 {self._snapshot_round} 回合的，"
+                        f"第 {self.last_completed_round} 回合的没定稿成功 → 现在重新定格最近一段")
+                else:
+                    log("   ⚠️ 还没有定稿的素材 → 现在定格一次（取最近 N 秒）")
                 self._load_replay(round_no)
 
             # --- 2. 用**锁内读到的最新长度**算播放时长 ---
             clip = hold_seconds if hold_seconds is not None else self.last_clip_seconds
             hold = self.expected_hold
+            if not hold:
+                # preflight 没跑成（很少见）→ 自己按配置算一个，
+                # 绝不能留 0 秒：那样 ticker 会在 5 秒后就把长回放掐掉。
+                hold = min(float(self.cfg["record_max_seconds"]) / max(self.cfg["speed"], 0.05),
+                           self.cfg["max_hold"])
             if clip:
                 play = clip / max(self.cfg["speed"], 0.05)
                 back = float(self.cfg.get("return_before_end", 0.0))
@@ -1257,8 +1377,21 @@ class ReplayDirector:
                     f"或把 min_score 调高、少放几个回放。")
 
         try:
+            # ★ 记下"按播放键时人在哪个场景"，播完切回**这里**（不一定非得是 HUD）。
+            #   你/ Astra 把画面放在「数据看板」时按播放，播完硬切回 HUD 会很突兀。
+            try:
+                cur = self.obs.scene_list()[1]
+            except Exception:
+                cur = self._current_scene
+            if cur and cur != self.cfg["replay_scene"]:
+                self._scene_before_replay = cur
+            target = self._return_scene()
+            # 让插件在片子结束那一帧切回去（引擎掐时间只是兜底）
+            self._set_plugin_next_scene(target)
+            if target != self.cfg["live_scene"]:
+                log(f"   [OBS] 播完会切回「{target}」（你是在这个场景上按的播放）")
             # 切场景 + 显示回放源。Visibility Action=Restart 会让它从头开始播。
-            if self.obs.scene_list()[1] != self.cfg["replay_scene"]:
+            if cur != self.cfg["replay_scene"]:
                 self._switch_program(self.cfg["replay_scene"])
             else:
                 self._current_scene = self.cfg["replay_scene"]
@@ -1274,6 +1407,79 @@ class ReplayDirector:
         """触发 Replay Source 的源级热键（必须带 contextName）。"""
         self.obs.request("TriggerHotkeyByName",
                          {"hotkeyName": name, "contextName": self.cfg["replay_item"]})
+
+    # ------------------------------------------------------------------
+    def _entry_skip(self, round_no=None):
+        """
+        算"素材入点该跳过开头多少秒"，让画面正好从**决胜击杀前一点点**开始。
+
+        用户实测反馈（2026-10-06）："把前面入点可以适当往后一点，不然会截取一些
+        无效片段（不是回合决胜击杀的片段）" —— 定格出来的素材结尾固定在"回合结束
+        后 1 秒"，素材长度固定为 record_max_seconds，所以前面那段（开局静走、
+        默认架枪、各打各的）全是废镜头。
+
+        素材里"击杀发生在第几秒"是可算的：
+            击杀在素材内的偏移 = 素材长度 - (定格时刻 - 最后一次击杀时刻)
+            入点 = 该偏移 - entry_lead_seconds（提前一点，能看清是谁开的枪）
+        """
+        cfg = self.cfg
+        if not cfg.get("entry_align_to_kill", True):
+            return 0.0
+        kill_at = self._last_kill_at
+        if not kill_at:
+            return 0.0
+        # 只在"这次要播的回合 == 记录到击杀的那个回合"时才敢裁，
+        # 免得拿上一回合的击杀时刻去裁这一回合的素材。
+        if (round_no is not None and self._last_kill_round is not None
+                and self._last_kill_round != round_no):
+            return 0.0
+        dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
+        # 现在正在定格：新素材的结尾就是这一刻。
+        # （不能用上一次定格的时刻，手动按 Enter 时两者能差十几秒。）
+        offset = dur - max(0.0, time.time() - kill_at)
+        skip = offset - float(cfg.get("entry_lead_seconds", 2.0))
+        # 至少给观众留 entry_min_keep_seconds；击杀在片头时 offset 天然为负 → 不裁。
+        keep = max(0.5, float(cfg.get("entry_min_keep_seconds", 2.5)))
+        return max(0.0, min(skip, dur - keep))
+
+    def _apply_start_delay(self, skip):
+        """
+        把"跳过素材开头 skip 秒"写进 Replay Source 的 StartDelay。
+
+        插件源码依据（obs-replay-source `replay-source.c`）：
+          * `replay_retrieve` :1156-1173 —— start_delay 为**负**时
+            `new_replay.trim_front = context->start_delay * -1`，即从片段开头裁掉这么多纳秒；
+            若 `|trim_front| >= 片段总长`，这个分支不成立 → trim_front 保持 0 → 原样从头播
+            （所以算过头了也不会把片子裁没，最多是没裁）。
+          * `replay_restart_at_begin` :1382-1395 —— 播放时直接 seek 到
+            `first_frame_timestamp + trim_front`，是**真跳**，不是快进。
+          * `replay_source_update` :2076 只设 `context->start_delay`；只有 duration /
+            sound_trigger / audio_threshold 变化才会 `obs_source_update(filter)`，
+            所以随时改 StartDelay 都安全，**不会把攒好的滚动缓冲冲掉**。
+        """
+        cfg = self.cfg
+        try:
+            ms = -int(round(max(0.0, skip) * 1000))
+            _, s = self.obs.input_settings(cfg["replay_item"])
+            if int(s.get("start_delay", 0) or 0) == ms:
+                return
+            self.obs.request("SetInputSettings",
+                             {"inputName": cfg["replay_item"],
+                              "inputSettings": {"start_delay": ms},
+                              "overlay": True, "overwrite": False})
+            # 第一次写的时候自检一次：写进去 → 读回来 → 比对，把结论打进日志。
+            # 这样"插件到底认不认这个键"在第一次开播就能看出来，不用猜。
+            if not self._start_delay_checked:
+                self._start_delay_checked = True
+                _, s2 = self.obs.input_settings(cfg["replay_item"])
+                got = int(s2.get("start_delay", 0) or 0)
+                if got == ms:
+                    log(f"   ✔ 入点通路自检通过：StartDelay={ms}ms（插件已确认）")
+                else:
+                    log(f"   ⚠️ 入点通路自检失败：想写 StartDelay={ms}，读回 {got}"
+                        f" → 这次会从素材片头播（把 entry_align_to_kill 关掉即可静音此功能）")
+        except Exception as e:
+            logv(cfg, f"   （设置入点失败，这次从片头播: {e}）")
 
     def _load_replay(self, round_no=None):
         """
@@ -1314,10 +1520,17 @@ class ReplayDirector:
                 f"这次素材会比上限短（{gap:.1f} 秒左右）。")
         try:
             mark = obs_log_mark()
+            # ★ 入点对齐：先算出"跳过素材开头多少秒"，在触发定格**之前**写进插件。
+            skip = self._entry_skip(round_no)
+            if skip > 0.05:
+                log(f"   ✂️ 入点：跳过素材开头 {skip:.1f} 秒，从决胜击杀前 "
+                    f"{float(cfg.get('entry_lead_seconds', 2.0)):.1f} 秒处开始")
+            self._apply_start_delay(skip)
             self.obs.request("TriggerHotkeyByName",
                              {"hotkeyName": name, "contextName": cfg["replay_item"]})
             self._last_load_replay = time.time()
-            self._last_snapshot_at = time.time()
+            self._last_clip_end_at = self._last_load_replay
+            self._last_snapshot_at = self._last_load_replay
             self._snapshot_ok = True
             self._snapshot_round = round_no if round_no is not None else self._snapshot_round
             self.counters["snapshots"] = self.counters.get("snapshots", 0) + 1
@@ -1333,9 +1546,21 @@ class ReplayDirector:
                 if true_len is not None:
                     break
             if true_len is not None:
-                self.last_clip_seconds = true_len
+                self.last_clip_raw_seconds = true_len
+                # 插件只在 |trim_front| < 片段总长时才真裁，否则原样从头播 → 如实记录。
+                applied = skip if 0.05 < skip < true_len else 0.0
+                self.last_clip_trim = applied
+                playable = max(0.0, true_len - applied)
+                self.last_clip_seconds = playable
                 want = float(cfg.get("record_max_seconds", 10.0))
-                log(f"   ✔ 素材已定稿（OBS 实测 {true_len:.2f} 秒）")
+                if applied > 0.05:
+                    log(f"   ✔ 素材已定稿（OBS 实测 {true_len:.2f} 秒，"
+                        f"入点跳过开头 {applied:.1f} 秒 → 可播 {playable:.2f} 秒）")
+                else:
+                    log(f"   ✔ 素材已定稿（OBS 实测 {true_len:.2f} 秒）")
+                    if skip > 0.05:
+                        log(f"      （入点本来想跳过 {skip:.1f} 秒，但片子只有 "
+                            f"{true_len:.2f} 秒，比入点还短 → 从头播）")
                 if true_len < 1.0:
                     log(f"   ❌ 太短了！只有 {true_len:.2f} 秒，几乎看不到东西。")
                     log("      常见原因：")
@@ -1347,12 +1572,14 @@ class ReplayDirector:
                     log("      检查一下游戏采集是否一直在出画面（别切走 HUD 场景）。")
             else:
                 self.last_clip_seconds = None
+                self.last_clip_raw_seconds = None
+                self.last_clip_trim = 0.0
                 log(f"   ✔ 已触发 Load replay（{name} @ {cfg['replay_item']}）")
         except Exception as e:
             log(f"   ⚠️  触发 Load replay 失败: {e}")
             log("      回放里会是空的。可用 --test-load-replay 单独排查。")
 
-    def _end_replay(self, why):
+    def _end_replay(self, why, switch_back=True):
         if not self.replay_active:
             return
         self.replay_active = False
@@ -1360,11 +1587,16 @@ class ReplayDirector:
         # ★ 顺序很重要：**先切场景，再隐藏源**。
         #   反过来的话，源先消失、画面会闪一下空帧，看起来就是"卡顿"。
         #   先切场景时，转场会把慢放画面盖住，回放源在被隐藏时已经不在节目输出里了。
+        #   切回去的目标是"按播放键时所在的那个场景"（见 _return_scene），
+        #   不一定非得是 HUD —— 你可能是在「数据看板」上按的播放键。
+        target = self._return_scene()
         try:
-            if self.obs.scene_list()[1] != self.cfg["live_scene"]:
-                self._switch_program(self.cfg["live_scene"])
+            if not switch_back:
+                log(f"   [OBS] 画面已经被切到「{self.obs.scene_list()[1]}」，不再抢回来")
+            elif self.obs.scene_list()[1] != target:
+                self._switch_program(target)
             else:
-                log(f"   [OBS] 已经在直播场景「{self.cfg['live_scene']}」")
+                log(f"   [OBS] 已经在「{target}」")
         except Exception:
             log("!! 切回直播场景失败:\n" + traceback.format_exc())
         try:
@@ -1390,6 +1622,23 @@ class ReplayDirector:
             elif self.replay_active and time.time() >= self.replay_hard_deadline:
                 self.counters["interrupted"] += 1
                 self._end_replay("超过硬上限")
+
+            # ★ 人工接管的锁必须有自动过期。
+            #   实测踩过的大坑：回放期间 Astra 按比赛阶段把场景切到「数据看板」，
+            #   引擎判定"回放中被人抢走画面" → 上锁"手动接管优先"，而**解开的唯一途径
+            #   是你手动按一下方向键**。结果整场后面每个回合都被跳过定格，按 Enter
+            #   只能反复播很早以前那一段素材。现在到点自动交还。
+            self._expire_manual_lock()
+
+    def _expire_manual_lock(self):
+        """人工接管的锁到点自动交还（manual_lock_seconds 秒；0 = 永不过期）。"""
+        if self.replay_active or not self.locked:
+            return False
+        ttl = float(self.cfg.get("manual_lock_seconds", 45.0) or 0.0)
+        if ttl > 0 and self._locked_at and time.time() - self._locked_at >= ttl:
+            self.unlock(f"人工接管已超过 {ttl:.0f} 秒，自动交还自动导播")
+            return True
+        return False
 
     def on_gsi_tick(self, phase):
         """
