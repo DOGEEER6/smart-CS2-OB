@@ -301,6 +301,27 @@ DEFAULTS = {
     "cs_console_require_focus": True,   # 必须 CS2 在前台（强烈建议保持 True）
     "cs_console_timeout_s": 900,        # start 模式下最多等 CS2 到前台多少秒
 
+    # ★ 回放后端（2026-10-08 加，用户要求"画质不损失把内存降下来"）：
+    #   "plugin"（默认）= Exeldro obs-replay-source 插件：内存里放**未压缩帧**（BGRA 4 字节/像素）
+    #                    → 1080p60 十秒两份 ≈ 9.95 GB；好处是能瞬间定格/任意入点真跳/倒放。
+    #   "obs"          = **OBS 自带 Replay Buffer**：内存里放**编码后**的数据（几十~几百 MB），
+    #                    按 → 时保存最近 N 秒的文件，再用 ffmpeg 按 (←,→) 做 **-c copy 零损失裁切**。
+    #                    需要：OBS 里启用 Replay Buffer（时长 ≥ record_max_seconds）、
+    #                    回放场景里有一个媒体源、以及本机有 ffmpeg。
+    #                    ⚠️ 必须在真机上验证（这台开发机没装 OBS）。
+    "replay_backend": "plugin",
+    # obs 后端用：回放场景里那个**媒体源**（ffmpeg_source）的名字；缺了会自动创建
+    "replay_media_item": "回放媒体源",
+    # obs 后端的裁切方式：
+    #   "copy"  = `-c copy`（**零损失、秒级**），但会**对齐到关键帧**（NVENC 默认 2 秒一个 I 帧，
+    #             想让入点更准就把 OBS 的关键帧间隔设成 1 秒）
+    #   "exact" = 对裁出来的那一小段做一次极短重编码（libx264 CRF trim_reencode_crf），
+    #             入点精确到帧，多一代编码（CRF 18 肉眼无感）
+    "trim_mode": "copy",
+    "trim_reencode_crf": 18,
+    # 按 SaveReplayBuffer 之后最多等多久（毫秒）让 OBS 把文件落盘
+    "obs_buffer_wait_ms": 8000,
+
     # --- 和 Astra 的协作（重要）---    # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
     #   require_live_scene : 只有当直播场景正好是 live_scene 时才插回放。
     #                        Astra 把画面切到"中场休息/数据看板"等场景时，引擎自动让位。
@@ -535,6 +556,48 @@ def memory_budget_gb(total_gb, avail_gb):
     if avail_gb:
         cap = min(cap, max(0.5, float(avail_gb) * 0.60))
     return cap
+
+
+def translate_obs_time_format(fmt):
+    """把 OBS 的文件名时间格式翻成 Python `strftime` 格式。
+
+    插件里 `save_file_format` 用的是 OBS 风格的 `回放_%CCYY-%MM-%DD_%hh.%mm.%ss`，
+    而 `obs` 后端是我们自己用 Python 命名文件，所以要翻译一遍（顺序很重要：
+    先长后短，否则 `%CCYY` 会被 `%C` 之类误伤）。
+    """
+    pairs = (("%CCYY", "%Y"), ("%YY", "%y"), ("%MM", "%m"), ("%DD", "%d"),
+             ("%hh", "%H"), ("%mm", "%M"), ("%ss", "%S"))
+    out = str(fmt or "")
+    for a, b in pairs:
+        out = out.replace(a, b)
+    return out
+
+
+def trim_plan(file_seconds, elapsed, min_seconds=0.1):
+    """算"从保存下来的缓冲文件里裁哪一段"。
+
+    `obs` 后端拿到的文件是 OBS 回放缓冲保存出来的**最近 file_seconds 秒**，
+    文件尾巴 ≈ 按 `→` 的那一刻；我们要的是"入点（按 ← 的那一刻）→ 现在"。
+
+    返回 `(start, length, rolled)`：
+      * `start`  —— 从文件开头跳过多少秒
+      * `length` —— 要多少秒
+      * `rolled` —— True 表示入点已经滚出缓冲（只能给整段）
+    """
+    try:
+        fsec = max(0.0, float(file_seconds or 0.0))
+        el = max(0.0, float(elapsed or 0.0))
+    except Exception:
+        return (0.0, 0.0, False)
+    if el <= 0:
+        return (0.0, fsec, False)
+    if el > fsec + 0.2:                 # 入点被滚掉了
+        return (0.0, fsec, True)
+    start = max(0.0, fsec - el)
+    length = min(el, fsec)
+    if length < min_seconds:
+        length = min(fsec, min_seconds)
+    return (round(start, 3), round(length, 3), False)
 
 
 def resource_pressure(avail_gb, total_gb, warn_pct=12.0, release_pct=6.0):
@@ -1182,6 +1245,48 @@ class ObsClient:
         """所有输入源（用来数 replay_source 实例 —— 每个实例都自己攒一份缓冲）。"""
         return (self.request("GetInputList") or {}).get("inputs") or []
 
+    # ---------------- OBS 自带 Replay Buffer（obs 后端用）----------------
+    # API 依据：obs-websocket v5 协议（docs/generated/protocol.json，2026-10-08 核对）
+    #   GetReplayBufferStatus → outputActive
+    #   StartReplayBuffer / StopReplayBuffer / ToggleReplayBuffer → outputActive
+    #   SaveReplayBuffer（无入参）→ 保存路径靠 GetLastReplayBufferReplay.savedReplayPath
+    #                              或 ReplayBufferSaved 事件（Outputs 订阅）
+    def replay_buffer_active(self):
+        try:
+            return bool((self.request("GetReplayBufferStatus") or {}).get("outputActive"))
+        except Exception:
+            return False
+
+    def start_replay_buffer(self):
+        return self.request("StartReplayBuffer") or {}
+
+    def stop_replay_buffer(self):
+        return self.request("StopReplayBuffer") or {}
+
+    def save_replay_buffer(self):
+        return self.request("SaveReplayBuffer") or {}
+
+    def last_replay_buffer_path(self):
+        return str((self.request("GetLastReplayBufferReplay") or {}).get("savedReplayPath") or "")
+
+    def output_settings(self, output_name):
+        """读输出设置（回放缓冲的时长等）—— 拿不到就返回 {}。"""
+        try:
+            return (self.request("GetOutputSettings", {"outputName": output_name})
+                    or {}).get("outputSettings") or {}
+        except Exception:
+            return {}
+
+    def set_output_settings(self, output_name, settings):
+        return self.request("SetOutputSettings",
+                            {"outputName": output_name, "outputSettings": settings}) or {}
+
+    def create_input(self, scene, input_name, input_kind, settings=None):
+        return self.request("CreateInput", {"sceneName": scene, "inputName": input_name,
+                                           "inputKind": input_kind,
+                                           "inputSettings": settings or {},
+                                           "sceneItemEnabled": False}) or {}
+
 
 class NullObsClient:
     """仿真 / 空跑用的假 OBS。"""
@@ -1241,7 +1346,57 @@ class NullObsClient:
                 "outputHeight": 1080, "fpsNumerator": 60, "fpsDenominator": 1}
 
     def input_list(self):
-        return [{"inputName": "Replay Source", "inputKind": "replay_source"}]
+        return [{"inputName": "Replay Source", "inputKind": "replay_source"},
+                {"inputName": "回放媒体源", "inputKind": "ffmpeg_source"}]
+
+    # ---------------- 仿真：OBS 自带 Replay Buffer（obs 后端）----------------
+    def replay_buffer_active(self):
+        self.calls.append(("GetReplayBufferStatus", None))
+        return bool(getattr(self, "rb_active", False))
+
+    def start_replay_buffer(self):
+        self.calls.append(("StartReplayBuffer", None))
+        if not getattr(self, "rb_configured", True):
+            raise RuntimeError("OBS 请求失败 StartReplayBuffer: "
+                               "Replay buffer is not configured")
+        self.rb_active = True
+        log("    [OBS] Replay Buffer 已启动（仿真）")
+        return {"outputActive": True}
+
+    def stop_replay_buffer(self):
+        self.calls.append(("StopReplayBuffer", None))
+        self.rb_active = False
+        log("    [OBS] Replay Buffer 已停止（仿真）")
+        return {"outputActive": False}
+
+    def save_replay_buffer(self):
+        self.calls.append(("SaveReplayBuffer", None))
+        # 仿真：写一个真文件出来（内容随便），路径按 OBS 的命名风格
+        import tempfile
+        d = getattr(self, "sim_buffer_dir", None) or tempfile.gettempdir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "Replay 2026-10-08 23-00-00.flv")
+        with open(path, "wb") as f:
+            f.write(b"\0" * 4096)
+        self.last_rb_path = path
+        log(f"    [OBS] 已保存回放缓冲（仿真）→ {path}")
+        return {}
+
+    def last_replay_buffer_path(self):
+        self.calls.append(("GetLastReplayBufferReplay", None))
+        return getattr(self, "last_rb_path", "")
+
+    def output_settings(self, output_name):
+        self.calls.append(("GetOutputSettings", output_name))
+        if output_name == "ReplayBuffer":
+            return {"duration": int(self.rb_seconds * 1000) if getattr(self, "rb_seconds", None)
+                    else 20000}
+        return {}
+
+    def create_input(self, scene, input_name, input_kind, settings=None):
+        self.calls.append(("CreateInput", scene, input_name, input_kind))
+        log(f"    [OBS] 创建输入 {input_name}({input_kind}) @ {scene}（仿真）")
+        return {"sceneItemId": 99}
 
     def request(self, req_type, data=None, timeout=5.0):
         self.calls.append((req_type, data))
@@ -1270,6 +1425,359 @@ class NullObsClient:
 # ============================================================================
 # 4. 重放编排器
 # ============================================================================
+
+class _SkipPluginSection(Exception):
+    """内部信号：当前用的是 obs 后端，跳过"只对插件有意义"的 preflight 段。
+
+    为什么不直接把这些段搬进单独方法：那些段又长又脆（涉及 start_delay / next_scene /
+    Enable 这些踩过坑的地方），搬动容易改坏；用一个信号异常在原地跳过，风险最小。
+    """
+
+
+class ObsBufferBackend:
+    """回放后端②：**OBS 自带 Replay Buffer**（编码后保存，内存几十~几百 MB）。
+
+    为什么要有它（用户原话："视频画质不损失的情况下能降下来内存占用吗？相机 4k 拍十秒
+    也不会几个 G"）：插件后端把**未压缩帧**放内存里（BGRA 4 字节/像素 → 1080p60 十秒
+    两份 ≈ 9.95 GB）；OBS 自带的 Replay Buffer 放的是**编码后**的数据（NVENC 几十 Mbps
+    → 同样条件几十 MB），代价只是"多一代编码"，而**裁切用 `-c copy` 是零损失**。
+
+    流程：
+        按 ←   → StartReplayBuffer（armed 模式；常驻模式在准备阶段就开着）
+        按 →   → SaveReplayBuffer → 等文件落盘 → 用 ffmpeg 按 (←,→) 裁成一小段
+        播放   → 把裁好的文件喂给回放场景里的**媒体源**，切场景播放（定格/续播逻辑同插件）
+        小键盘6 → 把这段文件另存到 save_dir（我们自己的文件名格式）
+
+    依赖：
+      * OBS 里必须**启用 Replay Buffer**（设置 → 输出 → 回放缓冲：勾选 + 时长 ≥
+        `record_max_seconds` + 编码器/码率给足）；没启用时 `StartReplayBuffer` 会报错，
+        这里会把 OBS 的原话打出来并告诉你去哪开。
+      * 本机要有 **ffmpeg**（裁剪用）。没有就不让启用这个后端（会自动退回插件后端）。
+      * 回放场景里要有一个**媒体源**（`ffmpeg_source`，默认叫「回放媒体源」），缺了会自动建。
+
+    ⚠️ 这套**必须在真机上验证**（开发机没装 OBS）：本项目只保证接口按
+    obs-websocket v5 协议写（`GetReplayBufferStatus/Start/Stop/SaveReplayBuffer/
+    GetLastReplayBufferReplay/GetOutputSettings/TriggerMediaInputAction`，2026-10-08 核对）。
+    """
+
+    name = "obs"
+
+    def __init__(self, director):
+        self.d = director
+        self.cfg = director.cfg
+        self.obs = director.obs
+        self.media_item = str(self.cfg.get("replay_media_item") or "回放媒体源")
+        self.media_item_id = None
+        self.ready = False
+        self.clip_path = ""          # 当前这段裁好的文件
+        self.clip_seconds = 0.0
+
+    # ---------------- 内存账（编码后，MB 级）----------------
+    def memory_mb(self):
+        """按码率估内存：`码率(Mbps) × 秒 / 8`，再乘 2（缓冲 + 保存中的一份）。"""
+        mbps = float(self.cfg.get("obs_buffer_mbps", 40.0) or 40.0)
+        sec = float(self.cfg.get("record_max_seconds", 10.0) or 10.0)
+        return mbps * sec / 8.0 * 2.0
+
+    # ---------------- 准备 ----------------
+    def prepare(self):
+        """preflight：找/建媒体源，检查 ffmpeg 与 Replay Buffer 是否可用。"""
+        cfg, obs = self.cfg, self.obs
+        # 1) ffmpeg：裁切必需
+        ff = str(cfg.get("ffmpeg_exe") or "").strip() or shutil.which("ffmpeg")
+        if not ff or not os.path.exists(ff):
+            log("   ❌ obs 后端需要 ffmpeg 来裁片段（`-c copy` 零损失），但这台机器上没有。")
+            log("      装一个：winget install Gyan.FFmpeg   或到 ffmpeg.org 下 zip 后把 bin 加进 PATH")
+            log("      想继续用回放：把 config.json 的 replay_backend 改回 \"plugin\"（默认）。")
+            return False
+        self.ffmpeg = ff
+        log(f"   ✅ ffmpeg: {ff}")
+
+        # 2) 回放场景里要有媒体源（缺了就建一个）
+        try:
+            items = obs.scene_items(cfg["replay_scene"])
+        except Exception as e:
+            log(f"   ❌ 读回放场景失败：{e}")
+            return False
+        for it in items:
+            if it.get("sourceName") == self.media_item:
+                self.media_item_id = it.get("sceneItemId")
+                break
+        if self.media_item_id is None:
+            log(f"   回放场景里没有媒体源「{self.media_item}」→ 自动创建一个（ffmpeg_source）")
+            try:
+                r = obs.create_input(cfg["replay_scene"], self.media_item, "ffmpeg_source",
+                                     {"is_local_file": True, "looping": False,
+                                      "close_when_inactive": False,
+                                      "restart_on_activate": False,
+                                      "clear_on_media_end": False})
+                self.media_item_id = r.get("sceneItemId")
+            except Exception as e:
+                log(f"   ❌ 创建媒体源失败：{e}")
+                log(f"      手动建：回放场景 → 添加「媒体源」，命名成「{self.media_item}」")
+                return False
+        try:
+            # 播放速度跟插件后端保持一致（0.7 倍慢放）
+            obs.request("SetInputSettings",
+                        {"inputName": self.media_item,
+                         "inputSettings": {"speed_percent": round(float(cfg.get("speed", 0.7)) * 100, 2),
+                                           "looping": False, "close_when_inactive": False},
+                         "overwrite": False})
+        except Exception as e:
+            logv(cfg, f"   （设置媒体源参数失败，忽略: {e}）")
+
+        # 3) Replay Buffer 可用性 + 时长
+        try:
+            settings = obs.output_settings("ReplayBuffer") or {}
+        except Exception:
+            settings = {}
+        buf_sec = None
+        for k in ("duration", "RecRBTime", "rec_rb_time", "time"):
+            if settings.get(k):
+                try:
+                    v = float(settings[k])
+                    buf_sec = v / 1000.0 if v > 1000 else v     # OBS 有的版本给毫秒
+                    break
+                except Exception:
+                    pass
+        cfg["obs_buffer_seconds"] = buf_sec
+        want = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+        if buf_sec:
+            log(f"   OBS 回放缓冲时长：{buf_sec:.0f} 秒"
+                f"{'' if buf_sec >= want else f'  ⚠️ 小于单段上限 {want:.0f} 秒 → 片段会被截短，'
+                   f'请在 OBS → 设置 → 输出 → 回放缓冲里把时长调大'}")
+        else:
+            log("   （读不到回放缓冲时长；请确认 OBS → 设置 → 输出 → 回放缓冲 里时长 ≥ "
+                f"{want:.0f} 秒）")
+        if not obs.replay_buffer_active():
+            log("   （回放缓冲当前没在跑 —— 省内存模式下按入点键才会启动它）")
+        self.ready = True
+        log(f"   ✅ obs 后端就绪：内存 ≈ {self.memory_mb():.0f} MB"
+            f"（按 {self.cfg.get('obs_buffer_mbps', 40)} Mbps 估；插件后端同条件是 GB 级）")
+        return True
+
+    # ---------------- 采集开关 ----------------
+    def arm(self, reason=""):
+        if not self.ready:
+            return False
+        if self.obs.replay_buffer_active():
+            return False
+        try:
+            self.obs.start_replay_buffer()
+            log(f"   ▶️ 已启动 OBS 回放缓冲（{reason or 'obs 后端'}）——"
+                f"内存 ≈ {self.memory_mb():.0f} MB，不是 GB 级")
+            return True
+        except Exception as e:
+            log(f"   ❌ 启动 OBS 回放缓冲失败：{e}")
+            log("      → 请到 OBS → 设置 → 输出 → **回放缓冲**：勾选「启用回放缓冲」，"
+                "时长调成 ≥ "
+                f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒，编码器选 NVENC，"
+                "码率给足（比如 40 Mbps）。")
+            return False
+
+    def release(self, reason=""):
+        if not self.ready or not self.obs.replay_buffer_active():
+            return False
+        try:
+            self.obs.stop_replay_buffer()
+            log(f"   ⏏  已停止 OBS 回放缓冲（{reason or 'obs 后端'}）——"
+                f"省下约 {self.memory_mb():.0f} MB")
+            return True
+        except Exception as e:
+            log(f"   ⚠️ 停止回放缓冲失败：{e}")
+            return False
+
+    # ---------------- 裁片段 ----------------
+    def capture_clip(self, mark_at):
+        """按 SaveReplayBuffer → 等落盘 → ffmpeg 裁成 (←,→) 那一段。
+
+        返回 `(path, seconds)`；失败返回 `(None, 0.0)`。
+        """
+        cfg, obs = self.cfg, self.obs
+        elapsed = max(0.0, time.time() - float(mark_at or 0.0))
+        prev = ""
+        try:
+            prev = obs.last_replay_buffer_path()
+        except Exception:
+            pass
+        try:
+            obs.save_replay_buffer()
+        except Exception as e:
+            log(f"   ❌ 保存回放缓冲失败：{e}")
+            log("      → OBS → 设置 → 输出 → 回放缓冲 里确认已勾选启用；"
+                "或者先按一下入点键让它跑起来。")
+            return (None, 0.0)
+        log(f"   💾 已让 OBS 保存最近的回放缓冲（入点到现在 {elapsed:.1f} 秒），等落盘…")
+
+        deadline = time.time() + max(2.0, float(cfg.get("obs_buffer_wait_ms", 8000)) / 1000.0)
+        path = ""
+        while time.time() < deadline:
+            time.sleep(0.25)
+            try:
+                p = obs.last_replay_buffer_path()
+            except Exception:
+                p = ""
+            if p and p != prev and os.path.exists(p):
+                path = p
+                break
+        if not path:
+            log("   ⚠️ 没等到保存好的文件（OBS 没回路径）—— 这一按没有可存的素材？")
+            return (None, 0.0)
+        size, done = self.d._wait_file_done(path, 0.0, timeout_extra=6.0)
+        log(f"   ✔ 缓冲文件：{path}（{size / 1e6:.1f} MB"
+            f"{'' if done else '，可能还在写'}）")
+
+        # 裁成"入点 → 现在"
+        fsec = 0.0
+        try:
+            fsec = self._probe_seconds(path)
+        except Exception:
+            fsec = 0.0
+        if not fsec:
+            fsec = min(elapsed, float(cfg.get("record_max_seconds", 10.0) or 10.0))
+            log(f"   （读不出文件时长，按 {fsec:.1f} 秒算）")
+        start, length, rolled = trim_plan(fsec, elapsed)
+        if rolled:
+            log(f"   ⚠️ 入点已经滚出缓冲了（缓冲里只有 {fsec:.1f} 秒，"
+                f"入点到出点隔了 {elapsed:.1f} 秒）→ 这一段从头播")
+        out = self._trim(path, start, length)
+        if not out:
+            log("   ⚠️ 裁切失败，退回用整段缓冲文件")
+            self.clip_path, self.clip_seconds = path, fsec
+            return (path, fsec)
+        self.clip_path, self.clip_seconds = out, length
+        log(f"   ✔ 片段已裁好（{length:.1f} 秒，从 {start:.1f} 秒处开始；"
+            f"{'零损失 copy' if self._trim_mode() == 'copy' else '精确重编码'}）")
+        return (out, length)
+
+    def _trim_mode(self):
+        m = str(self.cfg.get("trim_mode") or "copy").lower()
+        return m if m in ("copy", "exact") else "copy"
+
+    def _probe_seconds(self, path):
+        """用 ffmpeg 读时长（不装 ffprobe 也能读：解析 stderr 的 Duration）。"""
+        try:
+            r = subprocess.run([self.ffmpeg, "-hide_banner", "-i", path],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=20)
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or "")
+            if m:
+                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        except Exception:
+            pass
+        return 0.0
+
+    def _trim(self, src, start, length):
+        """裁切：默认 `-c copy`（零损失、秒级）；`exact` 模式重编码这一小段。"""
+        if length <= 0.05:
+            return ""
+        base, _ext = os.path.splitext(src)
+        out = base + "_clip.mp4"
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-ss", f"{start:.3f}", "-i", src, "-t", f"{length:.3f}"]
+        if self._trim_mode() == "exact":
+            crf = self.cfg.get("trim_reencode_crf", 18)
+            cmd += ["-c:v", "libx264", "-crf", f"{crf}", "-preset", "veryfast",
+                    "-c:a", "aac", "-b:a", "160k"]
+        else:
+            cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+        cmd += ["-movflags", "+faststart", out]
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=600)
+        except Exception as e:
+            log(f"   ⚠️ 裁切失败（{e}）")
+            return ""
+        if r.returncode != 0 or not os.path.exists(out):
+            log(f"   ⚠️ 裁切失败（ffmpeg 退出码 {r.returncode}）："
+                f"{(r.stderr or '').strip()[:200]}")
+            return ""
+        log(f"   ✂️ 裁切完成（{time.time() - t0:.1f} 秒，{os.path.getsize(out) / 1e6:.1f} MB）")
+        return out
+
+    # ---------------- 播放 ----------------
+    def play_clip(self, path=None):
+        """把裁好的文件喂给媒体源并在回放场景播放；返回预计播放秒数。"""
+        cfg, obs = self.cfg, self.obs
+        path = path or self.clip_path
+        if not path or not os.path.exists(path):
+            log("   ❌ 没有可播的片段文件（先在回放功能里按 ← 再按 →）")
+            return 0.0
+        try:
+            obs.request("SetInputSettings",
+                        {"inputName": self.media_item,
+                         "inputSettings": {"is_local_file": True, "local_file": path,
+                                           "looping": False, "close_when_inactive": False,
+                                           "restart_on_activate": False,
+                                           "clear_on_media_end": False},
+                         "overwrite": False})
+        except Exception as e:
+            log(f"   ⚠️ 给媒体源设置文件失败：{e}")
+        if self.media_item_id is not None:
+            obs.set_item_enabled(cfg["replay_scene"], self.media_item_id, True)
+        try:
+            obs.trigger_media_action(self.media_item, MEDIA_ACTION_RESTART)
+        except Exception as e:
+            logv(cfg, f"   （RESTART 失败，试 PLAY: {e}）")
+            obs.trigger_media_action(self.media_item, MEDIA_ACTION_PLAY)
+        speed = max(0.05, float(cfg.get("speed", 0.7) or 0.7))
+        hold = self.clip_seconds / speed + 0.6
+        log(f"   ▶️ 媒体源开始播放：{os.path.basename(path)}"
+            f"（{self.clip_seconds:.1f} 秒 @ {speed * 100:.0f}% → 约 {hold:.1f} 秒）")
+        return hold
+
+    def hide(self):
+        if self.media_item_id is not None:
+            try:
+                self.obs.set_item_enabled(self.cfg["replay_scene"], self.media_item_id, False)
+            except Exception:
+                pass
+
+    def media_state(self):
+        try:
+            return str((self.obs.media_input_status(self.media_item) or {})
+                       .get("mediaState") or "")
+        except Exception:
+            return ""
+
+    # ---------------- 留档 ----------------
+    def archive_clip(self, path=None):
+        """小键盘 6：把裁好的文件另存到 save_dir（用我们自己的文件名格式）。"""
+        cfg = self.cfg
+        path = path or self.clip_path
+        if not path or not os.path.exists(path):
+            log("   ❌ 手里还没有裁好的片段（先按 ← 再按 →）")
+            return ""
+        want_dir = str(cfg.get("save_dir") or "").strip()
+        if not want_dir:
+            try:
+                want_dir = str((self.obs.request("GetRecordDirectory") or {})
+                               .get("recordDirectory") or "")
+            except Exception:
+                want_dir = ""
+        if not want_dir:
+            want_dir = os.path.dirname(path)
+        try:
+            os.makedirs(want_dir, exist_ok=True)
+        except Exception:
+            pass
+        ext = os.path.splitext(path)[1] or ".mp4"
+        fmt = translate_obs_time_format(
+            cfg.get("save_file_format") or "回放_%CCYY-%MM-%DD_%hh.%mm.%ss")
+        try:
+            name = time.strftime(fmt) + ext
+        except Exception:
+            name = "回放_" + time.strftime("%Y-%m-%d_%H.%M.%S") + ext
+        dst = os.path.join(want_dir, name)
+        try:
+            shutil.copy2(path, dst)
+        except Exception as e:
+            log(f"   ❌ 另存失败：{e}")
+            return ""
+        log(f"   ✔ 已留档：{dst}（{os.path.getsize(dst) / 1e6:.1f} MB）")
+        return dst
+
 
 class ReplayDirector:
     def __init__(self, cfg, obs, simulate=False):
@@ -1316,6 +1824,12 @@ class ReplayDirector:
         self._mem_alert = ""             # 上次的内存警告级别（ok/warn/release）
         self._mem_alert_at = 0.0
         self._config_path = CONFIG_PATH
+        # ★ 回放后端：plugin（默认，插件内存缓冲）/ obs（OBS 自带 Replay Buffer，编码后）
+        self.backend_name = str(cfg.get("replay_backend") or "plugin").lower()
+        if self.backend_name not in ("plugin", "obs"):
+            self.backend_name = "plugin"
+        self.backend = ObsBufferBackend(self) if self.backend_name == "obs" else None
+        self.obs_backend_ready = False
         # 人工接管锁的自动过期
         self._locked_at = 0.0
         # 进回放之前人在哪个场景（回放结束后切回这里，而不是死板地切回 live_scene）
@@ -1356,11 +1870,20 @@ class ReplayDirector:
         for it in items:
             mark = ""
             if it.get("sourceName") == cfg["replay_item"]:
-                mark = "   <== 这就是回放源"
+                mark = "   <== 这就是回放源（plugin 后端用）"
                 self.replay_item_id = it.get("sceneItemId")
+            if it.get("sourceName") == str(cfg.get("replay_media_item") or ""):
+                mark = "   <== 这是媒体源（obs 后端用）"
             log(f"    - {it.get('sourceName')}  (id={it.get('sceneItemId')}, "
                 f"{'可见' if it.get('sceneItemEnabled') else '隐藏'}){mark}")
-        if self.replay_item_id is None:
+        if self.backend_name == "obs":
+            # obs 后端不用插件的回放源；它要的是回放场景里的**媒体源**
+            _ = self.backend.prepare()
+            self.obs_backend_ready = bool(_)
+            if not self.obs_backend_ready:
+                log("   ⚠️ obs 后端没准备好 —— 回放不可用；把 config.json 的 "
+                    "replay_backend 改回 \"plugin\" 可以继续用插件后端。")
+        elif self.replay_item_id is None:
             log(f"❌ 回放场景里找不到名为「{cfg['replay_item']}」的源，请核对名字。")
             return False
 
@@ -1376,6 +1899,8 @@ class ReplayDirector:
         # ⚠️ 关键安全检查：回放场景里必须有游戏采集源，否则回放源会失去输入（黑屏）
         src_names = [it.get("sourceName") for it in items]
         try:
+            if self.backend_name != "plugin":
+                raise _SkipPluginSection()      # obs 后端不碰插件的回放源
             kind, settings = self.obs.input_settings(cfg["replay_item"])
             video_src = settings.get("source") or ""
             self.video_source_name = video_src
@@ -1399,6 +1924,8 @@ class ReplayDirector:
             if dur or spd:
                 log(f"    （插件里的 Duration={dur}, Speed={spd}；请确认和配置里的 "
                     f"capture_seconds={cfg['capture_seconds']} / speed={cfg['speed']} 一致）")
+        except _SkipPluginSection:
+            log("   （obs 后端：跳过插件的「Video Source」检查）")
         except Exception as e:
             log(f"⚠️  读回放源设置失败（不影响运行）: {e}")
 
@@ -1431,6 +1958,8 @@ class ReplayDirector:
         #   OBS 工作目录里去，所以必须显式给一个目录。
         if cfg.get("save_replay_key", True):
             try:
+                if self.backend_name != "plugin":
+                    raise _SkipPluginSection()   # obs 后端自己命名/另存文件
                 want_dir = str(cfg.get("save_dir") or "").strip()
                 src = "config.save_dir"
                 if not want_dir:
@@ -1464,6 +1993,8 @@ class ReplayDirector:
                         f"（来自{src}），文件名 {want_fmt}")
                 else:
                     log(f"   『小键盘6=保留片段』就绪：存到 {want_dir or '(插件默认位置)'}")
+            except _SkipPluginSection:
+                log("   （obs 后端：『小键盘6=保留片段』由引擎自己另存文件，不写插件参数）")
             except Exception as e:
                 log(f"   （设置保留片段失败，小键盘 6 仍可用但可能存到默认位置: {e}）")
 
@@ -1482,6 +2013,8 @@ class ReplayDirector:
         want_ms = int(float(cfg.get("record_max_seconds", 10.0)) * 1000)
         want_spd = round(float(cfg.get("speed", 0.7)) * 100.0, 2)
         try:
+            if self.backend_name != "plugin":
+                raise _SkipPluginSection()   # obs 后端不写插件的 duration/next_scene/缓冲开关
             _, s = self.obs.input_settings(cfg["replay_item"])
             patch = {}
             if int(s.get("duration") or 0) != want_ms:
@@ -1516,6 +2049,9 @@ class ReplayDirector:
 
             log(f"   单段素材上限 {want_ms/1000:.0f} 秒，回放速度 {want_spd:.0f}%"
                 f" → 播放约 {want_ms/1000/max(want_spd/100,0.05):.1f} 秒")
+        except _SkipPluginSection:
+            log(f"   （obs 后端：单段上限 {want_ms/1000:.0f} 秒 / 速度 {want_spd:.0f}%"
+                f" → 由 OBS 回放缓冲的时长决定，请在 OBS 里设成 ≥ {want_ms/1000:.0f} 秒）")
         except Exception as e:
             log(f"   （同步 Duration/Speed 失败，不影响使用: {e}）")
 
@@ -1551,6 +2087,8 @@ class ReplayDirector:
                     f"{float(cfg.get('record_max_seconds', 10.0)):.0f} 秒。")
             except Exception as e:
                 log(f"   （冲旧缓冲失败，不影响使用: {e}）")
+        if self.backend_name == "obs":
+            return bool(self.obs_backend_ready)
         return True if self.replay_item_id is not None else False
 
     # ---------------- 内存护栏 ----------------
@@ -1568,6 +2106,26 @@ class ReplayDirector:
             return True
         if self.simulate:
             logv(cfg, "   （仿真模式：内存护栏跳过，改用纯函数单独回归）")
+            return True
+        if self.backend_name == "obs":
+            # obs 后端放的是**编码后**的数据（几十~几百 MB），不需要按未压缩帧那套拦；
+            # 只提醒"OBS 回放缓冲时长够不够"，以及磁盘空间。
+            try:
+                mb = self.backend.memory_mb()
+            except Exception:
+                mb = 0.0
+            buf = cfg.get("obs_buffer_seconds")
+            want = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+            log(f"   🧠 内存护栏（obs 后端）：编码后缓冲 ≈ {mb:.0f} MB，"
+                f"不需要按未压缩帧限制时长")
+            if buf and float(buf) + 0.5 < want:
+                log(f"      ⚠️ OBS 回放缓冲只有 {float(buf):.0f} 秒，小于单段上限 {want:.0f} 秒"
+                    f" → 片段会被截到 {float(buf):.0f} 秒；"
+                    f"请在 OBS → 设置 → 输出 → 回放缓冲里把它调大。")
+            if not self._check_disk_space():
+                self.replay_enabled = False
+                cfg["replay_enabled"] = False
+                return False
             return True
         info = self.memory_info()
         total, avail = system_memory_gb()
@@ -1669,6 +2227,23 @@ class ReplayDirector:
         这里把数字算出来、把这几个坑指出来，并按配置自动写回安全值。
         """
         cfg = self.cfg
+        if self.backend_name == "obs":
+            # obs 后端：内存是**编码后**的，没有"未压缩帧翻倍"这些坑，报个简短结论就行
+            try:
+                mb = self.backend.memory_mb()
+            except Exception:
+                mb = 0.0
+            buf = cfg.get("obs_buffer_seconds")
+            log("")
+            log("   🧠 内存体检（obs 后端：OBS 自带 Replay Buffer）")
+            log(f"      编码后缓冲 ≈ {mb:.0f} MB（按 {cfg.get('obs_buffer_mbps', 40)} Mbps × "
+                f"{float(cfg.get('record_max_seconds', 10.0)):.0f} 秒 × 2 份估）")
+            log(f"      OBS 回放缓冲时长：{'%.0f 秒' % float(buf) if buf else '(读不到)'}"
+                f"（必须 ≥ 单段上限 {float(cfg.get('record_max_seconds', 10.0)):.0f} 秒）")
+            log("      ★ 这条路径**不需要**按未压缩帧那套限制时长：4K 也只是内存里放编码数据，")
+            log("        片段是「保存缓冲文件 + ffmpeg 按 ←/→ 裁切」出来的（裁切零损失）。")
+            log("")
+            return
         try:
             _, s = self.obs.input_settings(cfg["replay_item"])
         except Exception as e:
@@ -1936,8 +2511,10 @@ class ReplayDirector:
             log(f"   ✔ 播放已裁好的片段（{age:.0f} 秒前裁的"
                 + (f"，{clip_len:.1f} 秒" if clip_len else "") + "）")
             try:
-                self._hk("ReplaySource.Last")
-                log("   ✔ 已选中最新一段素材")
+                if self.backend_name == "plugin":
+                    self._hk("ReplaySource.Last")
+                    log("   ✔ 已选中最新一段素材")
+                # obs 后端不用选段：手里就是刚裁好的那个文件
             except Exception as e:
                 logv(self.cfg, f"   （ReplaySource.Last 失败，忽略: {e}）")
 
@@ -1956,7 +2533,8 @@ class ReplayDirector:
                 hold = max(0.6, play - back)
                 log(f"   本次素材 {clip:.2f} 秒 @ {self.cfg['speed']*100:.0f}% 速度"
                     f" → 播 {play:.1f} 秒"
-                    + (f"，在剩 {back:.1f} 秒时切回" if back > 0.05 else "，播完由插件切回"))
+                    + (f"，在剩 {back:.1f} 秒时切回" if back > 0.05 else
+                       ("，播完由引擎切回" if self.backend_name == "obs" else "，播完由插件切回")))
             else:
                 # ★ 长度未知时**不要往短了猜** —— 猜短了片子会被腰斩（实测过）。
                 #   按素材上限给足时间，精确收尾交给插件的 next_scene。
@@ -1967,6 +2545,15 @@ class ReplayDirector:
             self._phase_at_start = self.state_ref.phase if self.state_ref else None
             # ★ 包装转场（stinger）会盖住回放的片头 —— 这段时间播放窗口也要往后推。
             wrap = self._wrap_seconds()
+            # obs 后端：把裁好的文件喂给媒体源并开播（返回实际要播多久）
+            obs_hold = None
+            if self.backend_name == "obs":
+                obs_hold = self.backend.play_clip()
+                if not obs_hold:
+                    self.replay_active = False
+                    log("   ⚠️ obs 后端播放失败，取消这次回放")
+                    return
+                hold = obs_hold
             # 播放窗口 += 5 秒安全垫：正常情况下插件会在片子结束那一帧就切回去，
             # 这个是"插件没生效"时的兜底。
             self.replay_until = time.time() + wrap + hold + 5.0
@@ -1998,7 +2585,8 @@ class ReplayDirector:
                 self._scene_before_replay = cur
             target = self._return_scene()
             # 让插件在片子结束那一帧切回去（引擎掐时间只是兜底）
-            self._set_plugin_next_scene(target)
+            if self.backend_name == "plugin":
+                self._set_plugin_next_scene(target)
             if target != self.cfg["live_scene"]:
                 log(f"   [OBS] 播完会切回「{target}」（你是在这个场景上按的播放）")
             # 切场景 + 显示回放源。Visibility Action=Restart 会让它从头开始播。
@@ -2006,7 +2594,8 @@ class ReplayDirector:
                 self._switch_program(self.cfg["replay_scene"])
             else:
                 self._current_scene = self.cfg["replay_scene"]
-            self.obs.set_item_enabled(self.cfg["replay_scene"], self.replay_item_id, True)
+            if self.backend_name == "plugin":
+                self.obs.set_item_enabled(self.cfg["replay_scene"], self.replay_item_id, True)
             for name, iid in self.overlay_item_ids:
                 self.obs.set_item_enabled(self.cfg["replay_scene"], iid, True)
             # ★ 立刻把回放定格在第一帧，等包装转场放完再开播（片头一帧不丢）。
@@ -2036,10 +2625,16 @@ class ReplayDirector:
                          {"hotkeyName": name, "contextName": self.cfg["replay_item"]})
 
     # ------------------------------------------------------------------
+    def _active_input(self):
+        """当前后端"正在播的那个输入源"名字（插件=回放源；obs 后端=媒体源）。"""
+        if self.backend_name == "obs":
+            return str(self.cfg.get("replay_media_item") or "")
+        return str(self.cfg.get("replay_item") or "")
+
     def _media_state(self):
-        """读回放源的媒体状态；读不到返回 None（老版本 obs-websocket 或请求失败）。"""
+        """读回放源/媒体源的媒体状态；读不到返回 None（老版本 obs-websocket 或请求失败）。"""
         try:
-            d = self.obs.media_input_status(self.cfg["replay_item"])
+            d = self.obs.media_input_status(self._active_input())
             return d.get("mediaState")
         except Exception as e:
             logv(self.cfg, f"   （读媒体状态失败，忽略: {e}）")
@@ -2070,7 +2665,11 @@ class ReplayDirector:
         t0 = time.time()
         if st is None or st == "OBS_MEDIA_STATE_PLAYING":
             try:
-                self._hk("ReplaySource.Pause")
+                if self.backend_name == "obs":
+                    # 媒体源直接用媒体接口暂停（就是"定格在第一帧"）
+                    self.obs.trigger_media_action(self._active_input(), MEDIA_ACTION_PAUSE)
+                else:
+                    self._hk("ReplaySource.Pause")
             except Exception as e:
                 log(f"   ⚠️ 定格第一帧失败（片头可能被转场盖住）: {e}")
                 return 0.0
@@ -2090,9 +2689,18 @@ class ReplayDirector:
         `start_timestamp` 按暂停时长补回去 → 接着定格那一帧往下播，不重新取素材。
         """
         try:
-            self.obs.trigger_media_action(self.cfg["replay_item"], MEDIA_ACTION_PLAY)
+            self.obs.trigger_media_action(self._active_input(), MEDIA_ACTION_PLAY)
             return True
         except Exception as e:
+            if self.backend_name == "obs":
+                log(f"   ⚠️ 媒体接口 PLAY 失败（{e}）—— obs 后端没有插件热键可退，"
+                    f"改用 RESTART 从头播这一段")
+                try:
+                    self.obs.trigger_media_action(self._active_input(), MEDIA_ACTION_RESTART)
+                    return True
+                except Exception as e2:
+                    log(f"!! 续播失败: {e2}")
+                    return False
             # 老 obs-websocket 没有媒体接口时的退路：Restart 是"同一段素材从头播"，
             # 也**不会**重新取素材，内容仍然是你框的那一段（只是不吃定格那一下）。
             log(f"   ⚠️ 媒体接口 PLAY 失败（{e}）→ 改用插件 Restart（同一段素材从头播）")
@@ -2186,6 +2794,15 @@ class ReplayDirector:
           * `:1010` 会往 OBS 日志写 `[replay_source: 'Replay Source'] start saving '<文件>'`，
             所以这里用"字节偏移读日志新行"的办法把完整路径回显给你。
         """
+        if self.backend_name == "obs":
+            # obs 后端：手里那个裁好的文件就是留档，引擎自己另存一份到 save_dir
+            log("💾 【小键盘 6 保留片段】obs 后端：把裁好的文件另存一份")
+            p = self.backend.archive_clip()
+            if p:
+                self._report_save_size(p, self.last_clip_seconds)
+            else:
+                log("   ⚠️ 没有可另存的片段 —— 先按【←】标入点、【→】标出点裁一段。")
+            return
         try:
             mark = obs_log_mark()
             self._hk("ReplaySource.Save")
@@ -2432,12 +3049,17 @@ class ReplayDirector:
         return info
 
     def arm_capture(self, reason=""):
-        """省内存模式：让插件**现在**开始攒帧（Enable）。
+        """省内存模式：让**当前后端**现在开始攒（插件 `Enable` / OBS `StartReplayBuffer`）。
 
         只有 armed 模式才这么干；buffer 模式本来就一直开着。
         """
         if self.replay_mode != "armed":
             return False
+        if self.backend_name == "obs":
+            if not self.obs_backend_ready:
+                return False
+            self._capture_armed_at = time.time()
+            return self.backend.arm(reason)
         if self._capture_disabled is False:      # 已经在攒，不用重复 Enable
             return False
         try:
@@ -2458,6 +3080,11 @@ class ReplayDirector:
         ⚠️ 只动"滚动缓冲"，**不动**已经取出来的那一段 —— 所以裁完立刻释放，
            手里那段照样能播、能按小键盘 6 存盘。
         """
+        if self.backend_name == "obs":
+            if not self.obs_backend_ready:
+                return False
+            self._capture_armed_at = 0.0
+            return self.backend.release(reason)
         if self._capture_disabled is True:
             return False
         info = self.memory_info()
@@ -2473,7 +3100,18 @@ class ReplayDirector:
             return False
 
     def clear_replays(self, reason=""):
-        """清掉内存里"已取出的片段"（Clear）—— 彻底还内存，但就不能再播/存了。"""
+        """清掉内存里"已取出的片段"—— 彻底还内存，但就不能再播/存了。"""
+        if self.backend_name == "obs":
+            # obs 后端没有"内存里的片段"，只有磁盘上那个裁好的文件
+            self._snapshot_ok = False
+            try:
+                self.backend.clip_path = ""
+                self.backend.clip_seconds = 0.0
+            except Exception:
+                pass
+            log(f"   🧹 已清掉手里的片段引用（{reason or '释放内存'}）"
+                f"（obs 后端：文件还在磁盘上，没有删）")
+            return True
         info = self.memory_info()
         try:
             self._hk("ReplaySource.Clear")
@@ -2730,14 +3368,9 @@ class ReplayDirector:
             return self._load_replay_locked(round_no, skip)
 
     def _load_replay_locked(self, round_no=None, skip=0.0):
-        """
-        实测结论（2026-10-05 在本机 OBS 32.2.2 + replay-source 上验证）：
-          * obs-websocket 的 TriggerHotkeyByName **可以**触发源级热键，
-            但必须带 contextName = 回放源的名字。
-          * 触发后 OBS 日志会出现 `replay added of X seconds`，用**字节偏移**读新行，
-            不能用"文本差异"判断（同样的长度文本完全一样，会认错）。
-          * ⚠️ 每次快照会"吃掉"滤镜缓冲：紧接着再按一次，只会有很短的一小段。
-        """
+        """按当前后端裁片段：plugin = 插件快照 + StartDelay；obs = 保存缓冲 + ffmpeg 裁。"""
+        if self.backend_name == "obs":
+            return self._load_replay_obs(round_no)
         cfg = self.cfg
         name = cfg.get("load_replay_hotkey") or ""
         if not name:
@@ -2811,6 +3444,35 @@ class ReplayDirector:
             log(f"   ⚠️  触发 Load replay 失败: {e}")
             log("      回放里会是空的。可用 --test-load-replay 单独排查。")
 
+    def _load_replay_obs(self, round_no=None):
+        """obs 后端"裁片段"：保存 OBS 回放缓冲 → 用 ffmpeg 裁出 (←,→) 那一段。
+
+        和插件后端的区别：插件是内存里搬指针（瞬时），这里是**落盘 + 裁剪**（几百毫秒）。
+        入点由 `trim_plan()` 用"文件时长 - 入点到现在"算出来，所以语义和插件一致：
+        播出来的就是从你按 ← 那一刻开始的。
+        """
+        cfg = self.cfg
+        mark = self.mark_in_at
+        t0 = time.time()
+        path, secs = self.backend.capture_clip(mark)
+        self._last_load_replay = time.time()
+        self._last_clip_end_at = self._last_load_replay
+        self._last_snapshot_at = self._last_load_replay
+        if path and secs > 0:
+            self._snapshot_ok = True
+            self.last_clip_seconds = float(secs)
+            self.last_clip_raw_seconds = float(secs)
+            self.last_clip_trim = 0.0
+            self.counters["snapshots"] = self.counters.get("snapshots", 0) + 1
+            log(f"   ✔ 素材已裁好（obs 后端：{secs:.1f} 秒，用时 {time.time() - t0:.1f} 秒）")
+            if secs < 1.0:
+                log("   ❌ 太短了！确认 OBS 的回放缓冲已经跑起来（省内存模式下要先按 ←）。")
+        else:
+            self._snapshot_ok = False
+            self.last_clip_seconds = None
+            self.last_clip_raw_seconds = None
+            log("   ⚠️ 这一按没拿到素材（obs 后端：缓冲没跑起来 / 没等到保存好的文件）")
+
     def _end_replay(self, why, switch_back=True):
         if not self.replay_active:
             return
@@ -2834,10 +3496,15 @@ class ReplayDirector:
         except Exception:
             log("!! 切回直播场景失败:\n" + traceback.format_exc())
         try:
-            self.obs.set_item_enabled(self.cfg["replay_scene"], self.replay_item_id, False)
+            if self.backend_name == "obs":
+                self.backend.hide()
+                log("   [OBS] 已隐藏回放媒体源")
+            else:
+                self.obs.set_item_enabled(self.cfg["replay_scene"], self.replay_item_id, False)
             for name, iid in self.overlay_item_ids:
                 self.obs.set_item_enabled(self.cfg["replay_scene"], iid, False)
-            log("   [OBS] 已隐藏回放源")
+            if self.backend_name != "obs":
+                log("   [OBS] 已隐藏回放源")
         except Exception:
             log("!! 隐藏回放源失败:\n" + traceback.format_exc())
 
@@ -6476,6 +7143,18 @@ def run_simulate(cfg):
     log(f"  本机实际内存：{['%.1f' % x if x else '?' for x in system_memory_gb()]} GB（总/可用）")
 
     log("")
+    log("──────── obs 后端（OBS 自带 Replay Buffer）的纯函数：裁切时间轴 ────────")
+    for _name, _fsec, _el in (("缓冲 20s，入点到现在 6s", 20, 6),
+                              ("缓冲 20s，入点到现在 20s", 20, 20),
+                              ("缓冲 20s，入点已滚出（25s）", 20, 25),
+                              ("缓冲 6s（刚启动），入点到现在 2s", 6, 2)):
+        _st, _ln, _rolled = trim_plan(_fsec, _el)
+        log(f"  {_name:28s} → 从 {_st:.1f}s 处裁 {_ln:.1f}s"
+            f"{'（入点滚出缓冲→给整段）' if _rolled else ''}")
+    log(f"  OBS 文件名格式翻译：{translate_obs_time_format('回放_%CCYY-%MM-%DD_%hh.%mm.%ss')}"
+        f"  (期望 回放_%Y-%m-%d_%H.%M.%S)")
+
+    log("")
     log("=== 仿真结果 ===")
     log(json.dumps(app.status(), ensure_ascii=False, indent=2))
     app.director.stop()
@@ -6623,6 +7302,10 @@ def parse_args():
     p.add_argument("--replay", choices=["on", "off"], help="回放功能总开关（默认关）")
     p.add_argument("--mode", choices=["armed", "buffer"],
                    help="内存模式：armed=省内存（按入点键才攒帧，默认）；buffer=常驻滚动缓冲")
+    p.add_argument("--backend", choices=["plugin", "obs"],
+                   help="回放后端：plugin=插件内存缓冲（默认，未压缩帧、GB 级）；"
+                        "obs=OBS 自带 Replay Buffer（编码后、几十~几百 MB，需 ffmpeg）")
+    p.add_argument("--media-item", help="obs 后端用：回放场景里的媒体源名字（默认「回放媒体源」）")
     p.add_argument("--memory-report", action="store_true",
                    help="只做内存体检：按画布/时长算出回放插件占多少内存，然后退出")
     p.add_argument("--show-keys", action="store_true", help="打印当前键位后退出")
@@ -6799,7 +7482,12 @@ def main():
         cfg["replay_enabled"] = (args.replay == "on")
     if args.mode is not None:
         cfg["replay_mode"] = args.mode
-    if (args.bind or args.replay is not None or args.mode is not None) and args.save_bind:
+    if args.backend is not None:
+        cfg["replay_backend"] = args.backend
+    if args.media_item:
+        cfg["replay_media_item"] = args.media_item
+    if (args.bind or args.replay is not None or args.mode is not None
+            or args.backend is not None or args.media_item) and args.save_bind:
         cfg_path = save_config(cfg, cfg_path) or cfg_path
         CONFIG_PATH = cfg_path
         log(f"已把设置写回 {cfg_path}")

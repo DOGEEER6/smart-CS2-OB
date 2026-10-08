@@ -94,6 +94,11 @@ KEY_MODE_LABELS = (
     ("hook", "全局钩子（默认，精确：能分主/小键盘 Enter）"),
     ("poll", "轮询（不经过输入管线，物理上不会拖住键盘）"),
 )
+# 回放后端（内存 vs 兼容性）
+BACKEND_LABELS = (
+    ("plugin", "插件 obs-replay-source（默认，GB 级内存）"),
+    ("obs", "OBS 自带 Replay Buffer（几十~几百 MB，需 ffmpeg）"),
+)
 
 # 第一次用（旁边还没有 config.json）时顶在按键区上方的那句提醒
 FIRST_RUN_HINT = (
@@ -281,6 +286,13 @@ class DirectorGui:
         km = str(cfg.get("key_mode", "hook")).lower()
         self.var_key_mode = tk.StringVar(
             value=dict(KEY_MODE_LABELS).get(km, KEY_MODE_LABELS[0][1]))
+        # 回放后端（plugin / obs）+ obs 后端的媒体源名
+        bk = str(cfg.get("replay_backend", "plugin")).lower()
+        self.var_backend = tk.StringVar(
+            value=dict(BACKEND_LABELS).get(bk, BACKEND_LABELS[0][1]))
+        self.var_media_item = tk.StringVar(
+            value=str(cfg.get("replay_media_item", "回放媒体源")))
+        self.var_backend.trace_add("write", lambda *_: self._update_estimate())
 
         # 秒数/模式一变就重算内存；端口一变就重算手机地址
         self.var_seconds.trace_add("write", lambda *_: self._update_estimate())
@@ -431,6 +443,27 @@ class DirectorGui:
         ttk.Label(f, text="回放速度（倍）").grid(row=row, column=2, sticky="e", padx=(16, 4), pady=(8, 4))
         ttk.Spinbox(f, from_=0.2, to=2.0, increment=0.1, textvariable=self.var_speed,
                     width=8).grid(row=row, column=3, sticky="w", padx=(0, 8), pady=(8, 4))
+
+        row += 1
+        ttk.Label(f, text="回放后端").grid(row=row, column=0, sticky="w", padx=8, pady=(8, 2))
+        ttk.Combobox(f, textvariable=self.var_backend, state="readonly", width=32,
+                     values=[v for _, v in BACKEND_LABELS]).grid(
+            row=row, column=1, columnspan=3, sticky="w", pady=(8, 2))
+        row += 1
+        ttk.Label(f, text="obs 后端：媒体源名").grid(row=row, column=0, sticky="w",
+                                             padx=8, pady=2)
+        ttk.Entry(f, textvariable=self.var_media_item, width=22).grid(
+            row=row, column=1, sticky="w", pady=2)
+        ttk.Label(f, text="（回放场景里那个媒体源；缺了引擎会自动建）",
+                  font=SMALL_FONT, foreground="#666666").grid(
+            row=row, column=2, columnspan=2, sticky="w", padx=(4, 8), pady=2)
+        row += 1
+        ttk.Label(f, text="插件后端＝内存放未压缩帧（1080p60 十秒两份 ≈ 9.95 GB，能瞬间定格/任意入点）；"
+                          "obs 后端＝OBS 自带 Replay Buffer（编码后 ≈ 几十~几百 MB，"
+                          "需 ffmpeg 且 OBS 里已启用回放缓冲）",
+                  font=SMALL_FONT, foreground="#666666", wraplength=820,
+                  justify="left").grid(row=row, column=0, columnspan=4, sticky="w",
+                                       padx=8, pady=(0, 6))
 
         self.lbl_estimate = ttk.Label(f, textvariable=self.var_estimate,
                                       wraplength=800, justify="left")
@@ -783,6 +816,12 @@ class DirectorGui:
         并直接告诉用户"这台机器装不装得下"，而不是按 1080p 估一个偏小 4 倍的数字。
         """
         copies = 1.0 if self.var_mode.get() == MODE_ARMED else 2.0
+        # obs 后端放的是**编码后**的数据（几十~几百 MB），和插件那套 GB 级算法无关
+        try:
+            bk2val = {text: val for val, text in BACKEND_LABELS}
+            is_obs = bk2val.get(self.var_backend.get(), "plugin") == "obs"
+        except Exception:
+            is_obs = False
         raw = str(self.var_seconds.get()).strip().replace("，", ".")
         try:
             seconds = float(raw)
@@ -798,6 +837,21 @@ class DirectorGui:
             canvas = None
         w, h, fps = canvas or rd.DEFAULT_CANVAS
         src = "OBS 画布" if canvas else "默认 1080p（没读到 OBS 配置）"
+        if is_obs:
+            mbps = float(self.cfg.get("obs_buffer_mbps", 40.0) or 40.0)
+            mb = mbps * seconds / 8.0 * 2.0
+            text = (f"obs 后端（OBS 自带 Replay Buffer）：按 {mbps:.0f} Mbps 估，"
+                    f"{seconds:.1f} 秒 ≈ {mb:.0f} MB"
+                    f"（插件后端同条件是 {w * h * 4 * fps * seconds / 1e9:.2f} GB/份）")
+            text += ("\n需要：OBS 里已启用「回放缓冲」（时长 ≥ "
+                     f"{seconds:.0f} 秒）+ 本机有 ffmpeg（用来按 ←/→ 裁片段）")
+            self.var_estimate.set(text)
+            for wdg in getattr(self, "_estimate_labels", []):
+                try:
+                    wdg.configure(foreground="#1a6b3c")
+                except Exception:
+                    pass
+            return
         est = rd.estimate_replay_memory(w, h, fps, seconds, copies=copies)
         text = f"{est['hint']}　[{src}]"
         color = "#222222"
@@ -994,6 +1048,10 @@ class DirectorGui:
         # 键盘监听方式
         km2val = {text: val for val, text in KEY_MODE_LABELS}
         cfg["key_mode"] = km2val.get(self.var_key_mode.get(), "hook")
+        # 回放后端 + obs 后端的媒体源名
+        bk2val = {text: val for val, text in BACKEND_LABELS}
+        cfg["replay_backend"] = bk2val.get(self.var_backend.get(), "plugin")
+        cfg["replay_media_item"] = self.var_media_item.get().strip() or "回放媒体源"
         return cfg
 
     def write_config(self, notify=True):
