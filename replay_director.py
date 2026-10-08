@@ -208,6 +208,12 @@ DEFAULTS = {
     "clear_replay_on_disable": True,
     # 启动时做内存体检：按真实画布/帧率/时长把数字算出来，并核对插件设置
     "memory_report": True,
+    # ★ 内存护栏（2026-10-08 加，默认开）：按本机内存 + 真实画布算一遍，
+    #   装不下就**自动把单段素材上限降下来**，连 2 秒都装不下就直接拒绝开回放。
+    #   为什么必须有：32 GB 机器 + 4K60 画布 + 10 秒 = 两份 ≈39.8 GB →
+    #   系统换页到整机失去响应、OBS 被拖死、只能长按电源键。
+    #   想自己承担风险就设 false（不推荐）。
+    "memory_guard": True,
     # 体检发现 Maximum replays > 1 / Capture internal frames = 开 时，自动写回正确值
     "memory_autofix": True,
     # ★ 提前多久切回直播场景。现在默认 **0**：改由插件在片子结束那一帧触发切回
@@ -420,6 +426,117 @@ def memory_estimate_from_cfg(cfg, width=None, height=None, fps=None):
         d["hint"] += "；常驻缓冲模式：这个数字会一直占着"
         d["mode"] = "buffer"
     return d
+
+
+# ---------------------------------------------------------------------------
+# 内存护栏（2026-10-08 加）：别让回放插件把整机拖死
+# ---------------------------------------------------------------------------
+# 背景（真机取证，见 docs/技术笔记.md §11）：一台 **32 GB** 的机器，OBS 画布是 **4K60**，
+# `record_max_seconds=10` → 插件要 `3840×2160×4×60×10 = 19.91 GB` 一份、两份 **39.81 GB**
+# —— 比整机内存还大。结果是系统疯狂换页：OBS 自己卡成 "停止与 Windows 交互并已关闭"、
+# 整机失去响应，只能长按电源键；事件日志是 `Kernel-Power 41` 且 `BugcheckCode=0`（没有蓝屏）
+# + 没有崩溃转储。所以光"默认关掉回放功能"不够 —— 一旦用户打开，仍然会死，
+# 必须在**启用回放/启动引擎**时按本机内存算一遍，装不下就自动降时长或直接拒绝。
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def system_memory_gb():
+    """(总物理内存 GB, 可用物理内存 GB)。纯 ctypes，不依赖任何库。"""
+    try:
+        st = _MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return (None, None)
+        return (st.ullTotalPhys / 1e9, st.ullAvailPhys / 1e9)
+    except Exception:
+        return (None, None)
+
+
+def canvas_from_obs_config():
+    """从 OBS 自己的配置文件里读"基础(画布)分辨率 + FPS"（纯读文件，不用连 OBS）。
+
+    为什么需要：插件缓冲是按**画布**算的（`画布宽×高×4×帧率×秒数`），而图形界面
+    在引擎启动前拿不到 OBS 的画布 —— 但 `%APPDATA%\\obs-studio\\basic\\profiles\\*\\basic.ini`
+    里就写着 `BaseCX/BaseCY/FPSCommon`。用它才能在设置窗口里**提前**给出真实估算，
+    而不是傻乎乎按 1080p 算出一个偏小的数字（4K 时低估 4 倍，正是死机的根源）。
+    读不到就返回 None，调用方退回 DEFAULT_CANVAS。
+    """
+    try:
+        prof_dir = os.path.join(os.environ.get("APPDATA", ""),
+                                "obs-studio", "basic", "profiles")
+        if not os.path.isdir(prof_dir):
+            return None
+        best = None
+        for name in sorted(os.listdir(prof_dir)):
+            ini = os.path.join(prof_dir, name, "basic.ini")
+            if not os.path.isfile(ini):
+                continue
+            try:
+                with open(ini, encoding="utf-8-sig", errors="replace") as f:
+                    txt = f.read()
+            except OSError:
+                continue
+            def num(key, cast=int):
+                m = re.search(rf"^{key}=([\d.]+)", txt, re.M)
+                if not m:
+                    return None
+                try:
+                    return cast(m.group(1))
+                except Exception:
+                    return None
+            w, h, fps = num("BaseCX"), num("BaseCY"), num("FPSCommon", float)
+            if w and h:
+                return (w, h, fps if fps else DEFAULT_CANVAS[2])
+    except Exception:
+        pass
+    return None
+
+
+def memory_budget_gb(total_gb, avail_gb):
+    """回放缓冲允许吃掉多少内存：总内存的 30%，且不超过当前可用内存的 60%。"""
+    if not total_gb:
+        return None
+    cap = float(total_gb) * 0.30
+    if avail_gb:
+        cap = min(cap, max(0.5, float(avail_gb) * 0.60))
+    return cap
+
+
+def plan_replay_seconds(width, height, fps, want_seconds, total_gb, avail_gb,
+                        copies=2.0, min_seconds=2.0, step=0.5):
+    """按内存给一个**安全时长**。
+
+    返回 `(safe_seconds, note)`：
+      * `safe_seconds == want_seconds` → 没问题；
+      * 更小 → 已降到这个值（note 是给人看的说明）；
+      * `None` → 这台机器**跑不了回放**（连 min_seconds 都装不下）。
+    `copies` 用 2：裁完片段那一瞬间"滚动缓冲 + 已取出那段"是同时在的，要按峰值算。
+    """
+    budget = memory_budget_gb(total_gb, avail_gb)
+    if budget is None:
+        return (want_seconds, "")      # 读不到内存就别拦（不能把功能拦死）
+
+    def need(sec):
+        return (float(width) * float(height) * 4 * float(fps) * float(sec)) / 1e9 * copies
+
+    want_need = need(want_seconds)
+    if want_need <= budget:
+        return (want_seconds, "")
+    s = float(want_seconds)
+    while s > min_seconds and need(s) > budget:
+        s = round(s - step, 2)
+    if need(s) > budget:
+        return (None, f"连 {min_seconds:.0f} 秒都要 {need(min_seconds):.2f} GB，"
+                      f"超过安全预算 {budget:.2f} GB")
+    return (s, f"{float(want_seconds):.1f} 秒需要 {want_need:.2f} GB，"
+               f"超过安全预算 {budget:.2f} GB")
 
 
 LOG_FILE = None
@@ -1306,6 +1423,10 @@ class ReplayDirector:
         log(f"预计单次回放最长占用 {self.expected_hold:.1f}s"
             f"（= 素材上限 {cfg.get('record_max_seconds')} 秒 / {cfg['speed']*100:.0f}% 速度）")
 
+        # ★ 内存护栏：必须在把 duration 写进插件**之前**跑 ——
+        #   它会按本机内存 + 真实画布决定"这台机器最多能攒几秒"。
+        self._apply_memory_guard()
+
         # 把"单段素材上限"和速度写进插件（config 变成唯一事实来源，不用手动同步两处）
         want_ms = int(float(cfg.get("record_max_seconds", 10.0)) * 1000)
         want_spd = round(float(cfg.get("speed", 0.7)) * 100.0, 2)
@@ -1380,6 +1501,75 @@ class ReplayDirector:
             except Exception as e:
                 log(f"   （冲旧缓冲失败，不影响使用: {e}）")
         return True if self.replay_item_id is not None else False
+
+    # ---------------- 内存护栏 ----------------
+    def _apply_memory_guard(self):
+        """按本机内存 + 真实画布，决定"这台机器最多能攒几秒"，装不下就降/就拒。
+
+        为什么必须有（真机取证，2026-10-08）：32 GB 机器 + 4K60 画布 + 10 秒
+        = 插件要两份 ≈39.8 GB → 系统换页到整机失去响应、OBS 被拖死、
+        只能长按电源键（事件日志 `Kernel-Power 41 / BugcheckCode=0`、无转储）。
+        返回 True 表示回放仍然可用；False 表示这台机器跑不了、已把回放功能关掉。
+        """
+        cfg = self.cfg
+        if not cfg.get("memory_guard", True):
+            log("   🧠 内存护栏：已按配置关闭（memory_guard=false）—— 自己不拦，出事自负")
+            return True
+        if self.simulate:
+            logv(cfg, "   （仿真模式：内存护栏跳过，改用纯函数单独回归）")
+            return True
+        info = self.memory_info()
+        total, avail = system_memory_gb()
+        if not total:
+            logv(cfg, "   （读不到本机内存，内存护栏跳过）")
+            return True
+        want = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+        safe, note = plan_replay_seconds(info["width"], info["height"], info["fps"],
+                                         want, total, avail, copies=2.0)
+        budget = memory_budget_gb(total, avail)
+        judge = ("没问题" if safe == want else
+                 ("装不下" if safe is None else f"降到 {safe:.1f} 秒"))
+        log("")
+        log(f"   🧠 内存护栏：本机 {total:.1f} GB（当前可用 {avail:.1f} GB），"
+            f"回放安全预算 ≈ {budget:.2f} GB → {judge}")
+        if safe == want:
+            return True
+        high_res = info["width"] >= 2560 or info["height"] >= 1440
+        log(f"      ⚠️ 当前设置：画布 {info['width']}x{info['height']}@{info['fps']:g}"
+            f"，单段 {want:.1f} 秒 → 峰值要两份 ≈ "
+            f"{info['width'] * info['height'] * 4 * info['fps'] * want / 1e9 * 2:.2f} GB")
+        log(f"      {note}")
+        if high_res:
+            log("      ★ 根治办法：把 OBS 的**基础(画布)分辨率降到 1920x1080** ——")
+            log("        插件缓冲是按画布算的，4K→1080p 直接少 4 倍内存；")
+            log("        观众本来就看 1080p，画质没有任何变化。一键工具：")
+            log("          python tools\\rescale_canvas.py --apply        （不用关 OBS，可回滚）")
+        if safe is not None and high_res and safe < 4.0:
+            # 4K 画布下能安全攒的秒数不到 4 秒 —— 这种"回放"没有使用价值，
+            # 与其让用户拿到 2 秒的片子，不如直接说清楚"先降画布"。
+            log(f"      ❌ 高分辨率画布下最多只能安全攒 {safe:.1f} 秒，回放没有使用价值 →")
+            log("         按**拒绝开启**处理：先降到 1080p 画布（上面那条命令），再打开回放功能。")
+            safe = None
+        if safe is None:
+            self.replay_enabled = False
+            cfg["replay_enabled"] = False
+            log("      ❌ 这台机器**跑不了回放**：已把回放功能关掉（提示器与自动切视角照常工作）。")
+            log("         想用回放：先降画布/帧率，或在 config.json 里把 record_max_seconds 调小。")
+            try:
+                self.release_capture("内存护栏：装不下")
+            except Exception:
+                pass
+            return False
+        log(f"      → 已自动把单段素材上限从 {want:.1f} 秒降到 **{safe:.1f} 秒**"
+            f"（≈{info['width'] * info['height'] * 4 * info['fps'] * safe / 1e9 * 2:.2f} GB 峰值）")
+        log("        不想让它自动降：config.json 里把 memory_guard 设成 false（不建议）")
+        cfg["record_max_seconds"] = safe
+        if not cfg.get("dry_run"):
+            try:
+                self.persist_config()
+            except Exception:
+                pass
+        return True
 
     # ---------------- 内存体检 ----------------
     def _memory_audit(self):
@@ -2217,6 +2407,14 @@ class ReplayDirector:
         关掉**不影响**手机提示器与自动切观察位 —— 那两件事和回放是并列的。
         """
         on = bool(on)
+        if on and not self.replay_enabled:
+            # ★ 打开回放前先过内存护栏：这台机器装不下就直接不开
+            #   （手机页面/图形界面随时能开，不能只靠启动时那一次检查）
+            if not self._apply_memory_guard():
+                log("🎛  回放功能没有打开：内存护栏判定这台机器装不下回放缓冲。")
+                if persist:
+                    self.persist_config()
+                return self.replay_enabled
         changed = (on != self.replay_enabled)
         self.replay_enabled = on
         self.cfg["replay_enabled"] = on
@@ -5957,6 +6155,24 @@ def run_simulate(cfg):
     log(f"  字符表：A → {CHAR_SCANCODE['A']}（期望 shift=True）"
         f"  _ → {CHAR_SCANCODE['_']}（期望 shift=True）"
         f"  a → {CHAR_SCANCODE['a']}（期望 shift=False）")
+
+    log("")
+    log("──────── 内存护栏（纯函数：按内存决定能攒几秒）────────")
+    _mc = canvas_from_obs_config()
+    log(f"  从 OBS 配置读到的画布：{_mc if _mc else '（没读到，退回 1080p60）'}")
+    for _name, _w, _h, _fps, _want, _tot, _av in (
+            ("4K60 10s / 32GB 机器（就是死机那台）", 3840, 2160, 60, 10, 32, 20),
+            ("4K60 10s / 64GB 机器", 3840, 2160, 60, 10, 64, 40),
+            ("1080p60 10s / 32GB 机器", 1920, 1080, 60, 10, 32, 20),
+            ("1080p60 10s / 16GB 机器", 1920, 1080, 60, 10, 16, 8),
+            ("1080p60 10s / 8GB 机器", 1920, 1080, 60, 10, 8, 4),
+            ("4K60 2s / 8GB 机器", 3840, 2160, 60, 2, 8, 4)):
+        _safe, _note = plan_replay_seconds(_w, _h, _fps, _want, _tot, _av)
+        _budget = memory_budget_gb(_tot, _av)
+        _verdict = ("❌ 装不下 → 拒绝开回放" if _safe is None else
+                    (f"✅ 维持 {_safe:.1f}s" if _safe == _want else f"⬇ 自动降到 {_safe:.1f}s"))
+        log(f"  {_name:34s} 预算 {_budget:5.2f} GB  {_verdict}   {_note}")
+    log(f"  本机实际内存：{['%.1f' % x if x else '?' for x in system_memory_gb()]} GB（总/可用）")
 
     log("")
     log("=== 仿真结果 ===")

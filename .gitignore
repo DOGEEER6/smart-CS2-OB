@@ -33,3 +33,6 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 死机排查时用户提供的现场截图/日志（本地证据，不进仓库）
+problem/

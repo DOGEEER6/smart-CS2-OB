@@ -423,8 +423,11 @@ class DirectorGui:
         ttk.Spinbox(f, from_=0.2, to=2.0, increment=0.1, textvariable=self.var_speed,
                     width=8).grid(row=row, column=3, sticky="w", padx=(0, 8), pady=(8, 4))
 
-        ttk.Label(f, textvariable=self.var_estimate, wraplength=800, justify="left").grid(
+        self.lbl_estimate = ttk.Label(f, textvariable=self.var_estimate,
+                                      wraplength=800, justify="left")
+        self.lbl_estimate.grid(
             row=row + 1, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 0))
+        self._estimate_labels = [self.lbl_estimate]
         ttk.Label(f, text="省内存模式：空闲时不占内存；常驻缓冲：上面这个数字会一直在",
                   font=SMALL_FONT, foreground="#666666").grid(
             row=row + 2, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 8))
@@ -747,23 +750,62 @@ class DirectorGui:
     #  内存估算（规格 §3.2）
     # ------------------------------------------------------------------
     def _update_estimate(self, *_):
+        """实时内存估算 + 内存护栏判断。
+
+        2026-10-08：用户报"电脑总是死机"，取证发现 32 GB 机器 + **4K60 画布** + 10 秒
+        → 插件要两份 ≈39.8 GB → 换页把整机拖死（OBS 自己卡成"停止与 Windows 交互"）。
+        所以这里必须用 **OBS 配置里的真实画布**（basic.ini 的 BaseCX/BaseCY）来估，
+        并直接告诉用户"这台机器装不装得下"，而不是按 1080p 估一个偏小 4 倍的数字。
+        """
         copies = 1.0 if self.var_mode.get() == MODE_ARMED else 2.0
         raw = str(self.var_seconds.get()).strip().replace("，", ".")
-        seconds = None
         try:
             seconds = float(raw)
         except ValueError:
             seconds = None
         if seconds is None or seconds <= 0:
-            # 输入框里还是半截数字（比如刚敲了个 "1"）：先按配置里存着的秒数估，
-            # 免得标签一边打字一边闪。
-            est = rd.memory_estimate_from_cfg(
-                {"record_max_seconds": self.cfg.get("record_max_seconds", 10.0),
-                 "replay_mode": self.var_mode.get()})
-        else:
-            w, h, fps = rd.DEFAULT_CANVAS          # 拿不到 OBS 画布时的兜底
-            est = rd.estimate_replay_memory(w, h, fps, seconds, copies=copies)
-        self.var_estimate.set(str(est.get("hint", "")))
+            seconds = float(self.cfg.get("record_max_seconds", 10.0) or 10.0)
+        ms = ["", "（你在输入框里还没打完，先按 10 秒算）"][0]
+
+        try:
+            canvas = rd.canvas_from_obs_config()
+        except Exception:
+            canvas = None
+        w, h, fps = canvas or rd.DEFAULT_CANVAS
+        src = "OBS 画布" if canvas else "默认 1080p（没读到 OBS 配置）"
+        est = rd.estimate_replay_memory(w, h, fps, seconds, copies=copies)
+        text = f"{est['hint']}　[{src}]"
+        color = "#222222"
+        try:
+            total, avail = rd.system_memory_gb()
+            if total:
+                safe, note = rd.plan_replay_seconds(w, h, fps, seconds, total, avail,
+                                                    copies=2.0)
+                high_res = w >= 2560 or h >= 1440
+                peak = w * h * 4 * fps * seconds / 1e9 * 2
+                if safe is None or (high_res and safe < 4.0):
+                    text += (f"\n⛔ 内存护栏：本机内存 {total:.1f} GB，这一套设置装不下"
+                             f"（峰值要两份 ≈ {peak:.1f} GB）")
+                    text += ("\n　　 把 OBS 的【基础(画布)分辨率】降到 1920x1080 再开回放"
+                             "（一键工具：python tools\\rescale_canvas.py --apply）"
+                             if high_res else
+                             "\n　　 把「单段素材上限」调小，或先不开回放功能")
+                    color = "#b00020"
+                elif safe != seconds:
+                    text += (f"\n⚠️ 内存护栏：本机内存 {total:.1f} GB，打开回放时会自动把"
+                             f"单段上限降到 {safe:.1f} 秒（{note}）")
+                    color = "#8a4b00"
+                else:
+                    text += f"\n✅ 内存护栏：本机内存 {total:.1f} GB，这套设置安全"
+                    color = "#1a6b3c"
+        except Exception:
+            pass
+        self.var_estimate.set(text + ms)
+        for wdg in getattr(self, "_estimate_labels", []):
+            try:
+                wdg.configure(foreground=color)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     #  按键
