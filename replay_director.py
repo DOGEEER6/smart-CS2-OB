@@ -175,6 +175,41 @@ DEFAULTS = {
     "record_max_seconds": 10.0,       # 滚动缓冲/单段素材最长多少秒（会写进插件的 Duration）
     "key_debounce": 0.5,              # 同一按键的重复触发间隔（秒）
     "min_clip_seconds": 0.3,          # ← 到 → 至少隔这么久才算有效（防手抖双击）
+
+    # ★ 2026-10-07 用户要求：**按键可以改**（适应不同键盘 —— 60% 键盘没有小键盘，
+    #   可以把"播放"改成 F8、"保留片段"改成 F9）。键名写法见下面的 KEY_TABLE，
+    #   也可以在图形界面 / --set-keys 里直接按一下你要的键，让程序自己填。
+    #   每个动作可以绑多个键（列表），例如 "play": ["numpad_enter", "f8"]。
+    "keys": {
+        "mark_in": ["left"],
+        "mark_out": ["right"],
+        "save": ["numpad6"],
+        "play": ["numpad_enter"],
+    },
+
+    # ★ 2026-10-07 用户要求：**回放功能做成可开关，默认关闭**。
+    #   关掉时：← / → / 小键盘6 / 小键盘Enter 四个键只提示、不动手，
+    #   同时把插件的滚动缓冲摘掉（ReplaySource.Disable）—— 那份内存真的还回去。
+    #   手机提示器 / 自动切观察位**不受影响**，照常工作。
+    "replay_enabled": False,
+
+    # ★ 内存模式 —— 决定 obs-replay-source 那几 GB 什么时候占着。
+    #   "armed"（默认，省内存）：平时插件是 Disable 的（≈0 占用）；
+    #        按 ← 才 Enable 开始攒帧，按 → 把这一段落取走后立刻再 Disable，
+    #        内存里**只剩最近裁出来的这一段**。
+    #        ⚠️ 代价：← 不能回溯了 —— 片段从你按 ← 那一刻开始（本来就推荐"打之前按 ←"）。
+    #   "buffer"（旧行为）：插件一直开着，内存里滚动保留最近 record_max_seconds 秒，
+    #        ← 可以标在已经过去的某一刻，但这份内存是**一直**占着的。
+    #   两种模式的实测依据（插件源码 replay-source.c / replay.h）见 docs/技术笔记.md §1.14。
+    "replay_mode": "armed",
+    # armed 模式下：裁完片段是否立刻释放滚动缓冲（False = 留着，下次不用重新 Enable）
+    "free_buffer_after_clip": True,
+    # 关闭回放功能 / 切换模式时，是否把"已经取出来的那一段"也清掉（彻底还内存）
+    "clear_replay_on_disable": True,
+    # 启动时做内存体检：按真实画布/帧率/时长把数字算出来，并核对插件设置
+    "memory_report": True,
+    # 体检发现 Maximum replays > 1 / Capture internal frames = 开 时，自动写回正确值
+    "memory_autofix": True,
     # ★ 提前多久切回直播场景。现在默认 **0**：改由插件在片子结束那一帧触发切回
     #   （见 preflight 里写的 next_scene）。只有你把 next_scene 清空、
     #   想让引擎自己掐时间时才需要设成 0.9 之类。
@@ -212,8 +247,38 @@ DEFAULTS = {
     "save_dir": "",
     "save_file_format": "回放_%CCYY-%MM-%DD_%hh.%mm.%ss",
 
-    # --- 和 Astra 的协作（重要）---
-    # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
+    # ★ 存出来的文件有多大？（2026-10-07 加，用户问"为什么视频这么大"）
+    #   插件只有两条编码通路（源码 replay-source.c:777-806，逐行核对）：
+    #     非无损（默认）：.flv，H.264 **CRF 23 / preset veryfast** + AAC；
+    #     无损（Lossless 开着）：.avi，**utvideo 无损** + pcm —— 体积是前者的几十倍
+    #                            （4K60 十秒 1~2.5 GB）。
+    #   引擎每次保存后会报「体积 + 实测码率」，并自动把 Lossless 纠回关。
+    #   想进一步压小，把下面这个改成 remux 或 reencode（需要装了 ffmpeg）：
+    #     "off"      = 什么都不做（默认）
+    #     "remux"    = 只换容器 .flv → .mp4（-c copy，零损失、秒级完成）
+    #     "reencode" = 用 libx264 CRF save_postprocess_crf 重编码压小（慢几十秒）
+    "save_postprocess": "off",
+    "save_postprocess_crf": 26,
+    # reencode 之后是否保留原来的 .flv（默认删掉，只留压小的那份）
+    "save_keep_original": False,
+
+    # --- ★ 每次开播前自动往 CS2 控制台输入的指令（2026-10-07 加）---
+    # 用户在设置窗口里填几条，引擎开播时替你"打开控制台 → 逐条敲进去 → 关掉"。
+    #   "cs_console_commands": ["sv_cheats 1", "mp_freezetime 5"]
+    # 机制和自动切观察位同一套：SendInput + 扫描码逐字符注入（不是注入游戏进程）。
+    # 安全阀：默认**只有 CS2 在前台**才发键（否则会打进 OBS / 浏览器）。
+    "cs_console_commands": [],          # 一行一条；空行和 // 开头的行会被忽略
+    "cs_console_key": "`",              # 打开控制台的键（可改 f10 / backtick / numpad_enter…）
+    "cs_console_trigger": "start",      # start=引擎起来后等到 CS2 在前台发一次（默认）
+                                        # round1=每场第 1 个冻结时间发一次
+                                        # manual=只手动（设置窗口按钮 / /control/console）
+    "cs_console_delay_ms": 400,         # 打开控制台后等多久再开始打（控制台是异步渲染的）
+    "cs_console_gap_ms": 120,           # 两条指令之间
+    "cs_console_close": True,           # 发完自动把控制台关掉
+    "cs_console_require_focus": True,   # 必须 CS2 在前台（强烈建议保持 True）
+    "cs_console_timeout_s": 900,        # start 模式下最多等 CS2 到前台多少秒
+
+    # --- 和 Astra 的协作（重要）---    # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
     #   require_live_scene : 只有当直播场景正好是 live_scene 时才插回放。
     #                        Astra 把画面切到"中场休息/数据看板"等场景时，引擎自动让位。
     #   lock_on_manual_scene : 是否把"任何非引擎发起的场景切换"都当成人工接管并锁定。
@@ -245,6 +310,116 @@ SCORE = {
     "plant": 12,         # 下包
     "last_man": 10,      # 最后一人存活到最后
 }
+
+
+# ---------------------------------------------------------------------------
+# 配置读写（图形界面 / --bind / 手机页面改设置都走这里，保证只有一套规则）
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = None      # 本次运行实际读的那个 config.json（main() 里填）
+
+
+def load_config(path=None):
+    """读配置：DEFAULTS ← config.json ← CLI 覆盖。
+
+    返回 (cfg, 实际使用的路径)。路径不存在就返回 (DEFAULTS 副本, 那个路径)，
+    不会报错 —— 全新电脑上双击 exe 就是这个状态，接着会去拉首次设置向导。
+    """
+    cfg = dict(DEFAULTS)
+    cfg_path = path or CONFIG_PATH
+    if not cfg_path:
+        cand = os.path.join(base_dir(), "config.json")
+        if os.path.exists(cand):
+            cfg_path = cand
+    if cfg_path and os.path.exists(cfg_path):
+        # ★ 用 utf-8-sig 读：记事本 / PowerShell 存出来的 config.json 可能带 BOM，
+        #   带 BOM 的文件用纯 utf-8 读会直接 JSONDecodeError，整个引擎起不来。
+        with open(cfg_path, encoding="utf-8-sig") as f:
+            cfg.update(json.load(f))
+    return cfg, cfg_path
+
+
+def save_config(cfg, path=None):
+    """把配置写回 config.json（UTF-8、indent=2，和首次设置向导一致）。
+
+    下划线开头的内部键（`_config_path` 之类）不落盘；写之前先写 .bak，
+    免得写坏了连原来的配置都没了。
+    """
+    global CONFIG_PATH
+    cfg_path = path or CONFIG_PATH or os.path.join(base_dir(), "config.json")
+    data = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
+    try:
+        if os.path.exists(cfg_path):
+            shutil.copyfile(cfg_path, cfg_path + ".bak")
+    except Exception:
+        pass
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, cfg_path)
+    CONFIG_PATH = cfg_path
+    return cfg_path
+
+
+# ---------------------------------------------------------------------------
+# 内存估算：obs-replay-source 到底占多少内存（纯计算，不连 OBS 也能算）
+# ---------------------------------------------------------------------------
+#
+# 依据（插件源码 replay.h:24-38 + replay-source.c:1066-1180，2026-10-07 逐行核对）：
+#   * 滚动缓冲在 **replay_filter** 滤镜里，存的是**未压缩**帧（画布宽×高×4 字节 BGRA）；
+#   * `Load replay`（ReplaySource.Replay）把滤镜里的帧指针**搬**到已取出的那段
+#     （circlebuf_pop_front → new_replay.video_frames），所以滤镜被掏空、从头再攒；
+#   * 于是稳态是 **2 份**：正在回填的滚动缓冲 + 已取出的那一段；
+#   * `replays`(Maximum replays，1~10，默认 1) 决定"已取出"能留几段 → 每多一段多一份；
+#   * `ReplaySource.Disable` 会把滤镜摘掉 → 滚动那一份真的还回去；
+#     `ReplaySource.Clear` 清掉所有已取出的段 → 另一份也还回去。
+DEFAULT_CANVAS = (1920, 1080, 60.0)     # 拿不到 OBS 画布时的兜底
+
+
+def estimate_replay_memory(width, height, fps, seconds, copies=2.0):
+    """按画布尺寸算回放插件的内存占用。
+
+    ⚠️ 用**十进制 GB**（1 GB = 1e9 字节）而不是 GiB —— 这样和
+    `docs/技术笔记.md` / `双机导播方案.md` 里记的实测数字（1080p 两份 ≈ 10 GB、
+    4K 两份 ≈ 40 GB、任务管理器里 obs64 私有 12.51 GB）对得上，不会让人以为算法错了。
+    """
+    width = int(width or DEFAULT_CANVAS[0])
+    height = int(height or DEFAULT_CANVAS[1])
+    fps = float(fps or DEFAULT_CANVAS[2]) or DEFAULT_CANVAS[2]
+    seconds = max(0.0, float(seconds or 0.0))
+    copies = max(0.0, float(copies))
+    frame_mb = width * height * 4 / 1048576.0          # 每帧多少 MB（这个用 MiB）
+    mb_per_sec = frame_mb * fps
+    one_copy_gb = width * height * 4 * fps * seconds / 1e9
+    steady_gb = one_copy_gb * copies
+    hint = (f"{width}x{height}@{fps:g} | 单段 {seconds:.1f}s | {copies:g} 份 "
+            f"≈ {steady_gb:.2f} GB")
+    if copies >= 1.9:
+        hint += "（滚动缓冲 + 已取出那段）"
+    elif copies >= 0.9:
+        hint += "（只留最近这一段）"
+    else:
+        hint += "（空闲，不占）"
+    return {"frame_mb": round(frame_mb, 2), "mb_per_sec": round(mb_per_sec, 1),
+            "one_copy_gb": round(one_copy_gb, 2), "steady_gb": round(steady_gb, 2),
+            "copies": copies, "width": width, "height": height, "fps": fps,
+            "seconds": seconds, "hint": hint}
+
+
+def memory_estimate_from_cfg(cfg, width=None, height=None, fps=None):
+    """用配置里的时长/模式算内存；拿不到 OBS 画布就用 DEFAULT_CANVAS。"""
+    mode = str(cfg.get("replay_mode") or "armed").lower()
+    seconds = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+    copies = 1.0 if mode == "armed" else 2.0
+    d = estimate_replay_memory(width or DEFAULT_CANVAS[0], height or DEFAULT_CANVAS[1],
+                               fps or DEFAULT_CANVAS[2], seconds, copies)
+    if mode == "armed":
+        d["hint"] += "；省内存模式：空闲时 ≈0，按 ← 之后才会涨到这么多"
+        d["mode"] = "armed"
+    else:
+        d["hint"] += "；常驻缓冲模式：这个数字会一直占着"
+        d["mode"] = "buffer"
+    return d
 
 
 LOG_FILE = None
@@ -303,6 +478,10 @@ class GsiHandler(http.server.BaseHTTPRequestHandler):
             code = 200
         elif path in ("/control/mark_out", "/control/record_stop"):
             body = json.dumps({"ok": app.mark_out()}).encode("utf-8")
+            code = 200
+        elif path == "/control/console":
+            # ★ 2026-10-07：手动发一次 CS 控制台指令（设置窗口的「现在发送一次」也走这里）
+            body = json.dumps({"ok": app.send_console("HTTP 手动")}).encode("utf-8")
             code = 200
         else:
             body = (b'{"error":"use /control/status | /lock | /unlock | /replay'
@@ -830,6 +1009,14 @@ class ObsClient:
         """读媒体源状态（mediaState / mediaDuration / mediaCursor）。"""
         return self.request("GetMediaInputStatus", {"inputName": input_name})
 
+    def video_settings(self):
+        """画布/帧率 —— 内存体检要用它算"一帧多少 MB"。"""
+        return self.request("GetVideoSettings") or {}
+
+    def input_list(self):
+        """所有输入源（用来数 replay_source 实例 —— 每个实例都自己攒一份缓冲）。"""
+        return (self.request("GetInputList") or {}).get("inputs") or []
+
 
 class NullObsClient:
     """仿真 / 空跑用的假 OBS。"""
@@ -879,7 +1066,17 @@ class NullObsClient:
         return {"mediaState": "OBS_MEDIA_STATE_PLAYING", "mediaDuration": 10000, "mediaCursor": 0}
 
     def input_settings(self, name):
-        return "replay_source", {"source": "游戏采集", "duration": 5.0, "speed": 0.7}
+        return "replay_source", {"source": "游戏采集", "duration": 5.0, "speed": 0.7,
+                                "replays": 1, "internal_frames": False,
+                                "start_delay": 0}
+
+    def video_settings(self):
+        # 仿真里用一份 1080p60 的画布（内存体检照样能算出数字来）
+        return {"baseWidth": 1920, "baseHeight": 1080, "outputWidth": 1920,
+                "outputHeight": 1080, "fpsNumerator": 60, "fpsDenominator": 1}
+
+    def input_list(self):
+        return [{"inputName": "Replay Source", "inputKind": "replay_source"}]
 
     def request(self, req_type, data=None, timeout=5.0):
         self.calls.append((req_type, data))
@@ -894,6 +1091,10 @@ class NullObsClient:
                     "transitionSettings": {"path": "C:/Temp/sim_stinger.mov"}}
         if req_type == "GetRecordDirectory":
             return {"recordDirectory": "C:/Temp/sim_records"}
+        if req_type == "GetVideoSettings":
+            return self.video_settings()
+        if req_type == "GetInputList":
+            return {"inputs": self.input_list()}
         if req_type == "GetInputSettings":
             return self.input_settings((data or {}).get("inputName") or "")[1]
         if req_type == "TriggerHotkeyByName":
@@ -938,6 +1139,15 @@ class ReplayDirector:
         self.last_replay_round = None
         self.last_completed_round = None  # 最近打完的回合号（判断手里的素材是不是这一回合的）
         self._start_delay_checked = False  # 是否已经验证过 StartDelay 能写进插件
+        # ★ 回放功能总开关 / 内存模式（2026-10-07 加；默认关、默认省内存）
+        self.replay_enabled = bool(cfg.get("replay_enabled", False))
+        self.replay_mode = str(cfg.get("replay_mode") or "armed").lower()
+        if self.replay_mode not in ("armed", "buffer"):
+            self.replay_mode = "armed"
+        self._capture_armed_at = 0.0     # armed 模式：上次让插件开始攒帧的时刻
+        self._capture_disabled = None    # None=还不知道；True=插件当前是 Disable 状态
+        self._memory_info = {}           # 最近一次内存体检的原始数据
+        self._config_path = CONFIG_PATH
         # 人工接管锁的自动过期
         self._locked_at = 0.0
         # 进回放之前人在哪个场景（回放结束后切回这里，而不是死板地切回 live_scene）
@@ -1132,21 +1342,127 @@ class ReplayDirector:
             except Exception as e:
                 log(f"   （设置 next_scene 失败，会用引擎计时兜底: {e}）")
 
-            # ★ 冲一次旧缓冲：改了 Duration 之后，滤镜里可能还留着"按旧上限攒的帧"
-            #   （实测：配置 10 秒但第一次裁出来是 12 秒）。启动时先放一次把它倒掉，
-            #   之后每次裁出来的长度就都是按新配置算的了。
-            try:
-                self._hk("ReplaySource.Replay")
-                log("   已冲掉启动前的旧缓冲（第一次裁片段会略长，之后就是新上限了）")
-            except Exception:
-                pass
             log(f"   单段素材上限 {want_ms/1000:.0f} 秒，回放速度 {want_spd:.0f}%"
                 f" → 播放约 {want_ms/1000/max(want_spd/100,0.05):.1f} 秒")
-            log(f"   ⚠️ 内存提示：这段缓冲要一直占着内存。4K 采集下 10 秒约 7.5 GB，"
-                f"1080p 约 1.9 GB。不够用就把 record_max_seconds 调小。")
         except Exception as e:
             log(f"   （同步 Duration/Speed 失败，不影响使用: {e}）")
+
+        # ★ 2026-10-07：内存体检 + 回放开关落地。
+        #   老版本的日志写的是"4K 10 秒约 7.5 GB / 1080p 约 1.9 GB"，**差了 5 倍**
+        #   （实测：4K 两份 ≈ 40 GB，1080p 两份 ≈ 10 GB）—— 就是这句误导让人以为是内存泄漏。
+        #   现在按画布 × 帧率 × 时长 × 份数**算真的数字**，并核对插件的内存相关设置。
+        if cfg.get("memory_report", True):
+            self._memory_audit()
+
+        # 插件当前该开还是该关：只有"回放功能开着 + 常驻缓冲模式"才需要一直攒帧。
+        if not self.replay_enabled:
+            self.release_capture("回放功能默认是关的（省内存）")
+            if cfg.get("clear_replay_on_disable", True):
+                self.clear_replays("回放功能默认是关的")
+            log("   🎛  回放功能：关闭（默认）—— 四个回放键只提示不动手；")
+            log("       想用就在设置窗口 / 手机页面上打开，或把 config.json 的 "
+                "replay_enabled 改成 true。")
+        elif self.replay_mode == "armed":
+            # 省内存模式：启动时不攒帧，等用户按 ← 再 Enable（那条通路上会打日志）。
+            self.release_capture("省内存模式：等按 ← 再开始攒帧")
+            log("   🎛  回放功能：开启（省内存模式）—— 按【←】标入点的那一刻才开始攒帧。")
+        else:
+            # 常驻缓冲模式：先冲一次旧缓冲（改了 Duration 之后滤镜里可能还留着旧上限的帧，
+            # 实测：配置 10 秒但第一次裁出来是 12 秒），然后一直攒着。
+            try:
+                self._hk("ReplaySource.Enable")
+                self._capture_disabled = False
+                self._capture_armed_at = time.time()
+                self._hk("ReplaySource.Replay")
+                log("   🎛  回放功能：开启（常驻缓冲模式）—— 已冲掉启动前的旧缓冲，"
+                    "现在开始一直攒着最近 "
+                    f"{float(cfg.get('record_max_seconds', 10.0)):.0f} 秒。")
+            except Exception as e:
+                log(f"   （冲旧缓冲失败，不影响使用: {e}）")
         return True if self.replay_item_id is not None else False
+
+    # ---------------- 内存体检 ----------------
+    def _memory_audit(self):
+        """把回放插件的内存真相打出来，并核对几个会让内存翻倍的设置。
+
+        为什么要做：用户 2026-10-07 反馈"每次用这个插件都占 10 G 内存，是不是缺陷"。
+        查下来不是泄漏，是插件的设计（未压缩帧滚动缓冲）+ 几个**会静默翻倍**的设置：
+          * 插件设置 `replays`(Maximum replays) —— 每多留一段就多一整份缓冲（1~10）；
+          * 插件设置 `internal_frames`(Capture internal frames) —— 换成内部帧，通常是多一份；
+          * 场景里有**多个** replay_source 实例 —— 每个都自己攒一份。
+        这里把数字算出来、把这几个坑指出来，并按配置自动写回安全值。
+        """
+        cfg = self.cfg
+        try:
+            _, s = self.obs.input_settings(cfg["replay_item"])
+        except Exception as e:
+            logv(cfg, f"   （内存体检读插件设置失败: {e}）")
+            s = {}
+
+        info = self.memory_info()
+        log("")
+        log("   🧠 内存体检（回放插件占多少）")
+        log(f"      画布/帧率：{info['width']}x{info['height']} @ {info['fps']:g}fps"
+            f"（每帧 {info['frame_mb']:.1f} MB，每秒 {info['mb_per_sec']:.0f} MB）")
+        log(f"      单段素材上限：{info['seconds']:.1f} 秒 → 一份 ≈ "
+            f"{info['one_copy_gb']:.2f} GB")
+        log(f"      当前模式：{'省内存（armed）' if self.replay_mode == 'armed' else '常驻缓冲（buffer）'}"
+            f" → 稳态 {info['copies']:g} 份 ≈ {info['steady_gb']:.2f} GB")
+        log(f"      「Maximum replays」= {s.get('replays', '(读不到)')}"
+            f"（每多 1 段就多一份 ≈ {info['one_copy_gb']:.2f} GB）")
+        log(f"      「Capture internal frames」= {s.get('internal_frames', '(读不到)')}"
+            f"（开着通常再多一份）")
+        log(f"      插件 Duration = {s.get('duration', '(读不到)')} ms"
+            f"（引擎会按 record_max_seconds 同步）")
+
+        # 场景里有几个 replay_source？每个实例都自己攒一份，这是最容易翻倍的地方。
+        try:
+            kinds = [str((i or {}).get("inputKind") or "") for i in (self.obs.input_list() or [])]
+            n_rs = sum(1 for k in kinds if k == "replay_source")
+            n_flt = sum(1 for k in kinds if k.startswith("replay_filter"))
+            log(f"      replay_source 实例：{n_rs} 个"
+                f"{'（正常，1 个就够）' if n_rs <= 1 else '　⚠️ 每多一个实例就多攒一份，建议只留一个'}")
+            if n_flt:
+                log(f"      另外还有 {n_flt} 个独立的 replay_filter 输入（也会各占一份）")
+        except Exception as e:
+            logv(cfg, f"      （数实例失败: {e}）")
+
+        if not self.replay_enabled:
+            log("      当前回放功能是**关闭**的：启动后已经 Disable，滚动缓冲不占内存。")
+        elif self.replay_mode == "armed":
+            log("      省内存模式：空闲时 ≈0；按 ← 之后会涨到 "
+                f"≈{info['one_copy_gb'] * 2:.2f} GB（攒帧 + 已取出那段），"
+                "裁完立即释放滚动那份。")
+        log("      依据：插件把最近 N 秒的**未压缩**帧放内存里（画布宽×高×4 字节×帧率），"
+            "不是内存泄漏。")
+        log("      想更省：record_max_seconds 调小（10→5 秒省一半），或降到 720p/30fps。")
+
+        patch = {}
+        try:
+            if int(s.get("replays") or 1) != 1:
+                patch["replays"] = 1
+                log(f"      ⚠️ Maximum replays = {s.get('replays')}："
+                    f"这会多占 {info['one_copy_gb'] * (int(s.get('replays') or 1) - 1):.2f} GB"
+                    f" → 建议改回 1")
+            if s.get("internal_frames"):
+                patch["internal_frames"] = False
+                log("      ⚠️ Capture internal frames 是开着的：通常会让内存再多一份 → 建议关掉")
+        except Exception:
+            pass
+        if patch:
+            if cfg.get("memory_autofix", True):
+                try:
+                    self.obs.request("SetInputSettings",
+                                     {"inputName": cfg["replay_item"],
+                                      "inputSettings": patch, "overwrite": False})
+                    log(f"      ✔ 已自动写回安全值：{patch}（想自己留着就把 config.json 的 "
+                        "memory_autofix 设成 false）")
+                except Exception as e:
+                    log(f"      ⚠️ 自动写回失败: {e}")
+            else:
+                log(f"      （memory_autofix=false，没有自动改。建议在 OBS 里改成 {patch}）")
+        log("")
+
 
     # ---------------- 击杀事件：计划快照 ----------------
     def on_kill(self, sid, kill_count, round_no, name):
@@ -1608,7 +1924,23 @@ class ReplayDirector:
         threading.Thread(target=self._report_save, args=(mark,), daemon=True).start()
 
     def _report_save(self, mark):
-        """等 OBS 日志里出现 `start saving '<文件>'`，把完整路径打出来。"""
+        """等 OBS 日志里出现 `start saving '<文件>'`，把完整路径打出来。
+
+        2026-10-07 追加：**体积体检 +（可选）后处理**。用户问"为什么视频这么大？
+        相机 10 秒 4K 也没这么大啊，编码有问题吧" —— 插件其实只有两条编码通路
+        （源码 `replay-source.c:777-806`，逐行核对过）：
+
+          * **非无损（默认，引擎会强制）**：`ffmpeg_muxer` 输出 **`.flv`**，
+            视频 `obs_x264` **CRF 23 / preset veryfast / profile high**，
+            音频 `ffmpeg_aac`。CRF 是"保质量不保码率"，4K60 复杂画面典型
+            十几到几十 Mbps —— 和手机 4K60（≈50 Mbps）同量级。
+          * **无损（Lossless 开着）**：`ffmpeg_output` + **utvideo**（无损帧内）
+            + `pcm_s16le`→ **`.avi`**。4K60 大约 100~250 MB/s，
+            10 秒就是 **1~2.5 GB**，比手机视频大几十倍。
+
+        所以："文件是不是 `.avi`" 基本就能判定是不是踩了 lossless（这里会自动纠回），
+        而 `.flv` 的话会把实测码率算出来跟手机对比，让人自己判断。
+        """
         for _ in range(40):          # 最多等 ~12 秒
             time.sleep(0.3)
             for l in obs_log_since(mark, limit=200):
@@ -1620,10 +1952,337 @@ class ReplayDirector:
                     if n:
                         log(f"     （这段约 {n:.1f} 秒，写完要等同样长的时间，"
                             f"期间别关 OBS）")
+                    threading.Thread(target=self._postprocess_save,
+                                     args=(path, n), daemon=True).start()
                     return
         log("   ⚠️ 没在 OBS 日志里看到 'start saving' —— 这一按没有可存的素材。")
         log("      缓冲是插件自己在累积的，只有 OBS 刚启动 / 刚 Enable 过缓冲时才会是空的：")
         log("      先按【←】标入点、【→】标出点裁一段出来，再按小键盘 6 保留。")
+
+    # ------------------------------------------------------------------
+    # 保存后的体积体检（+ 可选后处理）
+    # ------------------------------------------------------------------
+    def _wait_file_done(self, path, seconds, timeout_extra=8.0):
+        """等文件写完：大小连续两次采样不变就算完（写盘是实时的）。"""
+        try:
+            wait_max = max(5.0, float(seconds or 0.0) + timeout_extra)
+        except Exception:
+            wait_max = 20.0
+        t0 = time.time()
+        last, stable, done = -1, 0, False
+        while time.time() - t0 < wait_max:
+            time.sleep(0.5)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size > 0 and size == last:
+                stable += 1
+                if stable >= 2:
+                    done = True
+                    break
+            else:
+                stable = 0
+            last = size
+        try:
+            return os.path.getsize(path), done
+        except OSError:
+            return 0, False
+
+    def _report_save_size(self, path, seconds):
+        """把"这个文件多大、多少 Mbps、和手机比怎么样"打出来。"""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        mb = size / 1e6
+        mbps = (size * 8 / 1e6 / seconds) if seconds and seconds > 0.1 else None
+        log(f"   📦 文件体积：{mb:.1f} MB" + (f"（{seconds:.1f} 秒）" if seconds else ""))
+        if ext == ".avi":
+            log(f"   ❌ 这是 **.avi 无损（utvideo）** 写的 —— 体积是 H.264 的几十倍！")
+            log("      原因：Replay Source 插件里的「Lossless」被打开了。")
+            log("      修法：设置窗口 / OBS 里把 Lossless 关掉（引擎每次启动也会自动纠回），"
+                "关掉后同样一段通常只有几 MB ~ 几十 MB。")
+            self._fix_lossless()
+            return size
+        if mbps:
+            # 手机 4K60 大概 50 Mbps 上下，4K30 约 25 Mbps —— 给一个能直接对比的参照
+            log(f"   📊 码率约 {mbps:.1f} Mbps（H.264 CRF23 veryfast，插件写死的参数）")
+            if mbps > 80:
+                log("      比手机 4K60（≈50 Mbps）还高：CRF 是「保质量不保码率」，"
+                    "画布越大、画面越乱就越大。")
+                log("      想小一点：把 record_max_seconds 调小（片段短了自然小）、"
+                    "画布降到 1080p，或把 config.json 的 save_postprocess 打开（见下）。")
+            else:
+                log("      参照：手机 4K60 视频约 50 Mbps、4K30 约 25 Mbps —— 这个量级是正常的。")
+        keep = self.cfg.get("save_postprocess") or "off"
+        if keep != "off":
+            ff = shutil.which("ffmpeg")
+            if not ff:
+                log(f"   ⚠️ save_postprocess={keep} 但没找到 ffmpeg —— 跳过（原文件照旧可用）")
+            else:
+                log(f"   🛠 后处理（save_postprocess={keep}）：{os.path.basename(path)}")
+        return size
+
+    def _fix_lossless(self):
+        """把插件里的 Lossless 关掉（它是 .avi 巨大的唯一原因）。"""
+        try:
+            _, s = self.obs.input_settings(self.cfg["replay_item"])
+            if int(s.get("lossless") or 0):
+                self.obs.request("SetInputSettings",
+                                 {"inputName": self.cfg["replay_item"],
+                                  "inputSettings": {"lossless": False}, "overwrite": False})
+                log("      ✔ 已把插件的 Lossless 关掉（下一次保存就是 .flv H.264）")
+        except Exception as e:
+            log(f"      （自动关 Lossless 失败：{e}；请在 OBS 里手动关）")
+
+    def _postprocess_save(self, path, seconds):
+        """保存完成后的体积体检 +（可选）后处理。
+
+        `save_postprocess`：
+          * `off`（默认）—— 什么都不做，只报体积/码率；
+          * `remux`    —— 只换容器：`.flv` → `.mp4`（`-c copy`，零质量损失、秒级完成）；
+          * `reencode` —— 用 libx264 CRF `save_postprocess_crf`（默认 26）重编码压小，
+                         慢一些；原来的 .flv 按 `save_keep_original` 决定留不留。
+        """
+        size, done = self._wait_file_done(path, seconds)
+        if not size:
+            return
+        if not done:
+            log(f"   （{os.path.basename(path)} 还在写，跳过体积体检）")
+            return
+        self._report_save_size(path, seconds)
+
+        mode = str(self.cfg.get("save_postprocess") or "off").lower()
+        if mode == "off":
+            return
+        ff = shutil.which("ffmpeg")
+        if not ff:
+            return
+        base = os.path.splitext(path)[0]
+        if mode == "remux":
+            out = base + ".mp4"
+            cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                   "-c", "copy", "-movflags", "+faststart", out]
+        elif mode == "reencode":
+            try:
+                crf = float(self.cfg.get("save_postprocess_crf", 26) or 26)
+            except Exception:
+                crf = 26.0
+            out = base + "_small.mp4"
+            cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                   "-c:v", "libx264", "-crf", f"{crf:g}", "-preset", "veryfast",
+                   "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out]
+        else:
+            log(f"   ⚠️ save_postprocess={mode} 不认识（只能是 off / remux / reencode）")
+            return
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=600)
+        except Exception as e:
+            log(f"   ⚠️ 后处理失败（{e}）—— 原文件没动，照旧可用")
+            return
+        if r.returncode != 0 or not os.path.exists(out):
+            log(f"   ⚠️ 后处理失败（ffmpeg 退出码 {r.returncode}）："
+                f"{(r.stderr or '').strip()[:200]}")
+            log("      原文件没动，照旧可用。")
+            return
+        try:
+            new_mb = os.path.getsize(out) / 1e6
+        except OSError:
+            new_mb = 0
+        log(f"   ✅ 后处理完成（{time.time() - t0:.1f} 秒）：{os.path.basename(out)}"
+            f"（{new_mb:.1f} MB）")
+        if mode == "reencode" and not self.cfg.get("save_keep_original", False):
+            try:
+                os.remove(path)
+                log(f"      （已删掉原来的 {os.path.basename(path)}；"
+                    f"想留着就把 config.json 的 save_keep_original 设成 true）")
+            except OSError as e:
+                log(f"      （原文件删除失败：{e}）")
+
+    # ------------------------------------------------------------------
+    # 回放功能开关 / 内存模式（2026-10-07）
+    # ------------------------------------------------------------------
+    # 插件侧依据（replay-source.c，2026-10-07 逐行核对，结论写进 docs/技术笔记.md §1.14）：
+    #   * `ReplaySource.Disable` 热键 → `c->disabled = true; obs_source_update()` →
+    #     把 `replay_filter` 从采集源上摘掉（:2012-2044）→ **滚动缓冲那几 GB 真的还回去**；
+    #   * `ReplaySource.Enable` 重新挂上滤镜、缓冲从零开始累积（:2092-2114）；
+    #   * `Load replay` 把滤镜里的帧**搬**到"已取出的那一段"（:1108-1112），
+    #     所以取出之后滤镜是空的、重新累积 —— 稳态才是两份。
+    #   * `ReplaySource.Clear` 清掉所有已取出的段并释放帧（:1610-1630）。
+    def memory_info(self, canvas=None):
+        """算出这台机器上回放插件到底占多少内存（能读 OBS 就读真画布）。
+
+        ⚠️ 画布只查一次并缓存 —— 手机页面每个 GSI 包都会调这里（10Hz），
+           不能每个包都去问一次 OBS。
+        """
+        cfg = self.cfg
+        w, h, fps = (canvas or (None, None, None))
+        if not w or not h or not fps:
+            cached = getattr(self, "_canvas_cache", None)
+            if cached:
+                w, h, fps = cached
+            else:
+                try:
+                    vs = self.obs.video_settings() or {}
+                    w = vs.get("baseWidth") or vs.get("outputWidth") or DEFAULT_CANVAS[0]
+                    h = vs.get("baseHeight") or vs.get("outputHeight") or DEFAULT_CANVAS[1]
+                    num, den = vs.get("fpsNumerator"), vs.get("fpsDenominator")
+                    fps = (float(num) / float(den)) if num and den else DEFAULT_CANVAS[2]
+                except Exception:
+                    w, h, fps = DEFAULT_CANVAS
+                self._canvas_cache = (w, h, fps)
+        seconds = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+        copies = 1.0 if self.replay_mode == "armed" else 2.0
+        info = estimate_replay_memory(w, h, fps, seconds, copies)
+        info["mode"] = self.replay_mode
+        info["enabled"] = bool(self.replay_enabled)
+        info["armed"] = bool(self._capture_armed_at and self._capture_disabled is False)
+        self._memory_info = info
+        return info
+
+    def _log_memory(self, prefix="   "):
+        info = self.memory_info()
+        if self.replay_mode == "armed":
+            now_txt = (f"当前正在攒帧（约 {info['one_copy_gb']:.2f} GB + 已取出那份）"
+                       if info["armed"] else "当前空闲（≈0）")
+            log(f"{prefix}🧠 内存：{info['hint']}")
+            log(f"{prefix}   省内存模式（armed）：按 ← 才开始攒帧，裁完立即释放 → {now_txt}")
+        else:
+            log(f"{prefix}🧠 内存：{info['hint']}（常驻缓冲模式：这个数字一直占着）")
+        return info
+
+    def arm_capture(self, reason=""):
+        """省内存模式：让插件**现在**开始攒帧（Enable）。
+
+        只有 armed 模式才这么干；buffer 模式本来就一直开着。
+        """
+        if self.replay_mode != "armed":
+            return False
+        if self._capture_disabled is False:      # 已经在攒，不用重复 Enable
+            return False
+        try:
+            self._hk("ReplaySource.Enable")
+            self._capture_disabled = False
+            self._capture_armed_at = time.time()
+            dur = float(self.cfg.get("record_max_seconds", 10.0) or 10.0)
+            log(f"   ▶️ 插件开始攒帧（{reason or '省内存模式'}）—— "
+                f"片段从这一刻开始，最多能攒 {dur:.0f} 秒")
+            return True
+        except Exception as e:
+            log(f"   ⚠️ 让插件开始攒帧失败（{e}）—— 这次可能裁不出东西")
+            return False
+
+    def release_capture(self, reason=""):
+        """省内存模式：把滚动缓冲摘掉（Disable），那几 GB 真的还回去。
+
+        ⚠️ 只动"滚动缓冲"，**不动**已经取出来的那一段 —— 所以裁完立刻释放，
+           手里那段照样能播、能按小键盘 6 存盘。
+        """
+        if self._capture_disabled is True:
+            return False
+        info = self.memory_info()
+        try:
+            self._hk("ReplaySource.Disable")
+            self._capture_disabled = True
+            self._capture_armed_at = 0.0
+            log(f"   ⏏  已收起滚动缓冲（{reason or '省内存模式'}）—— "
+                f"约省下 {info['one_copy_gb']:.2f} GB，手里那段片段不受影响")
+            return True
+        except Exception as e:
+            log(f"   ⚠️ 收起滚动缓冲失败（{e}）")
+            return False
+
+    def clear_replays(self, reason=""):
+        """清掉内存里"已取出的片段"（Clear）—— 彻底还内存，但就不能再播/存了。"""
+        info = self.memory_info()
+        try:
+            self._hk("ReplaySource.Clear")
+            self._snapshot_ok = False
+            self.last_clip_seconds = None
+            self.last_clip_raw_seconds = None
+            log(f"   🧹 已清掉内存里保留的片段（{reason or '释放内存'}）—— "
+                f"约省下 {info['one_copy_gb']:.2f} GB")
+            return True
+        except Exception as e:
+            log(f"   ⚠️ 清片段失败（{e}）")
+            return False
+
+    def set_replay_enabled(self, on, persist=True, reason=""):
+        """回放功能总开关（默认关）。关掉时顺便把插件内存还回去。
+
+        关掉**不影响**手机提示器与自动切观察位 —— 那两件事和回放是并列的。
+        """
+        on = bool(on)
+        changed = (on != self.replay_enabled)
+        self.replay_enabled = on
+        self.cfg["replay_enabled"] = on
+        if not on:
+            if self.replay_active:
+                self._end_replay("回放功能已关闭")
+            if self.replay_mode == "armed":
+                self.release_capture("回放功能已关闭")
+            if self.cfg.get("clear_replay_on_disable", True):
+                self.clear_replays("回放功能已关闭")
+            if changed:
+                log("🎛  回放功能 → 关闭：← / → / 保留片段 / 播放 四个键不再动手；")
+                log("    手机提示器与自动切观察位不受影响，照常工作。")
+        else:
+            if self.replay_mode == "armed":
+                if self._capture_disabled is False:
+                    self.release_capture("切到省内存模式")
+                log("🎛  回放功能 → 开启（省内存模式）：按【←】标入点的那一刻才开始攒帧。")
+            else:
+                log("🎛  回放功能 → 开启（常驻缓冲模式）：插件一直攒着最近 "
+                    f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒。")
+                self.arm_capture("回放功能开启")
+        if persist:
+            self.persist_config()
+        return self.replay_enabled
+
+    def set_replay_mode(self, mode, persist=True):
+        """切换内存模式：armed（省内存，默认）/ buffer（常驻滚动缓冲，可回溯）。"""
+        mode = str(mode or "").lower()
+        if mode not in ("armed", "buffer"):
+            return self.replay_mode
+        if mode == self.replay_mode:
+            return self.replay_mode
+        self.replay_mode = mode
+        self.cfg["replay_mode"] = mode
+        if mode == "armed":
+            # 切回省内存：立刻把常驻的那份缓冲摘掉（没在攒帧就不会有事）
+            if not self.replay_active:
+                self.release_capture("切到省内存模式")
+            log("🧠 内存模式 → 省内存：平时不占内存；按 ← 才开始攒帧，"
+                "裁完立刻释放，内存里只留最近这一段。")
+            log("    ⚠️ 注意：这个模式下 ← 不能往回标了 —— 片段从你按 ← 那一刻开始。")
+        else:
+            self.arm_capture("切到常驻缓冲模式")
+            log("🧠 内存模式 → 常驻缓冲：插件一直攒着最近 "
+                f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒，"
+                "← 可以标在已经过去的某一刻（代价是这份内存一直占着）。")
+        self._log_memory()
+        if persist:
+            self.persist_config()
+        return self.replay_mode
+
+    def persist_config(self):
+        """把当前配置写回 config.json（手机页面上改的开关要能记住）。"""
+        path = self._config_path or CONFIG_PATH
+        if not path:
+            return None
+        try:
+            saved = save_config(self.cfg, path)
+            self._config_path = saved
+            logv(self.cfg, f"   （已把设置写回 {saved}）")
+            return saved
+        except Exception as e:
+            log(f"   ⚠️ 写回配置失败: {e}")
+            return None
+
 
     # ------------------------------------------------------------------
     # 素材入点：由 ← 手动标出来，不再是"固定秒数 / 识别击杀"
@@ -1634,24 +2293,32 @@ class ReplayDirector:
 
         ★ 2026-10-06 用户决定：素材完全由 ← / → 手动框选。
           `←` 只记一个时刻；真正裁素材发生在按 `→` 的时候，所以这一步要回答：
-          "从按 ← 到现在，已经被滚出缓冲多少秒？"
+          "从按 ← 到现在，缓冲里还剩多少、要裁掉多少开头？"
 
-        模型（跟插件的滚动缓冲一致）：
-          * 缓冲里最多只有 `record_max_seconds` 秒，而且是**边打边滚**的；
-          * 每次裁素材（Load replay）会把缓冲**掏空**、从那一刻重新累积；
-          * 所以按 → 的那一刻，缓冲里能用的秒数 =
-                avail = min(record_max_seconds, now - 上次裁素材的时刻)
-          * 按 ← 到现在过了 elapsed 秒，那入点已经位于缓冲内的
-                avail - elapsed 位置 → 这就是要裁掉的开头长度。
+        两种模式（2026-10-07 加，见 cfg["replay_mode"]）：
 
-        入点已经滚出去了（elapsed > avail）→ 打警告并返回 0.0
-        （= 整段播；总比裁出一个空片段强。用户要求："提示先按 ←，不抓"的同理：
-         框不住就明说，不要偷偷给一段错的。）
+        **buffer（常驻滚动缓冲，旧行为）**：缓冲里最多 `record_max_seconds` 秒、
+        边打边滚，每次裁素材（Load replay）会把它掏空重新累积。于是：
+            avail = min(record_max_seconds, now - 上次裁素材的时刻)
+            skip  = avail - elapsed          # 入点已经位于缓冲内的这个位置
+        入点滚出去了（elapsed > avail）→ 打警告返回 0.0（整段播）。
+
+        **armed（省内存，默认）**：插件是**按 ← 那一刻才 Enable 开始攒帧**的，
+        所以缓冲起点就是入点，正常情况下 skip = 0；只有"攒过头"（按 → 太晚、
+        超过缓冲上限，开头被覆盖）时才裁掉被覆盖的那一段：
+            skip = max(0, elapsed - record_max_seconds)
         """
         cfg = self.cfg
         dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
         now = time.time()
         elapsed = max(0.0, now - float(mark_at or 0.0))
+        if self.replay_mode == "armed":
+            if elapsed > dur + 0.2:
+                over = elapsed - dur
+                log(f"   ✂️ 这一段攒了 {elapsed:.1f} 秒、超过缓冲上限 {dur:.0f} 秒 → "
+                    f"开头 {over:.1f} 秒已经被滚动覆盖，从 {over:.1f} 秒处开始播")
+                return over
+            return 0.0
         since_last = now - self._last_snapshot_at if self._last_snapshot_at else dur
         avail = min(dur, max(0.0, since_last))
         if elapsed > avail + 0.2:
@@ -1661,6 +2328,7 @@ class ReplayDirector:
                 f"（缓冲最多留 {dur:.0f} 秒）。")
             return 0.0
         return max(0.0, avail - elapsed)
+
 
     def mark_window(self):
         """
@@ -1681,11 +2349,19 @@ class ReplayDirector:
         cfg = self.cfg
         dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
         now = time.time()
-        since_last = now - self._last_snapshot_at if self._last_snapshot_at else dur
-        avail = min(dur, max(0.0, since_last))
+        if self.replay_mode == "armed":
+            # 省内存模式：缓冲起点 = 按 ← 那一刻（Enable 的时刻），所以
+            # "还剩几秒能按 →" = 缓冲上限 - 已经过去的时间（超过就开始覆盖开头）。
+            since_arm = (now - self._capture_armed_at) if self._capture_armed_at else 0.0
+            avail = min(dur, max(0.0, since_arm))
+        else:
+            since_last = now - self._last_snapshot_at if self._last_snapshot_at else dur
+            avail = min(dur, max(0.0, since_last))
         out = {
             "bufMax": round(dur, 1),
             "avail": round(avail, 1),
+            "mode": self.replay_mode,
+            "enabled": bool(self.replay_enabled),
             "clipReady": bool(self._snapshot_ok),
             "clipAgo": (round(now - self._last_snapshot_at, 1)
                         if self._last_snapshot_at else None),
@@ -1697,8 +2373,16 @@ class ReplayDirector:
         if self.mark_in_at:
             elapsed = max(0.0, now - float(self.mark_in_at))
             out["markAgo"] = round(elapsed, 1)
-            out["markLeft"] = round(avail - elapsed, 1)
-            out["expired"] = elapsed > avail + 0.2
+            if self.replay_mode == "armed":
+                out["markLeft"] = round(dur - elapsed, 1)
+                out["expired"] = elapsed > dur + 0.2
+            else:
+                out["markLeft"] = round(avail - elapsed, 1)
+                out["expired"] = elapsed > avail + 0.2
+            out["clipMax"] = round(dur, 1)
+        elif self.replay_mode == "armed" and not self._capture_armed_at:
+            # 还没按 ←：提示"按 ← 才开始攒帧"
+            out["idle"] = True
         return out
 
     def _apply_start_delay(self, skip):
@@ -1777,7 +2461,8 @@ class ReplayDirector:
         # 限流：两次 Load replay 之间至少要隔着 record_max_seconds，否则第二次是残缺的
         gap = time.time() - self._last_load_replay
         need = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
-        if self._last_load_replay and gap < need:
+        if self._last_load_replay and gap < need and self.replay_mode != "armed":
+            # 省内存模式下"短"是正常的（缓冲从按 ← 那一刻才开始攒），不吓唬用户
             log(f"   ⚠️  距上次裁片只有 {gap:.1f}s（需要 {need:.1f}s），"
                 f"这次素材会比上限短（{gap:.1f} 秒左右）。")
         try:
@@ -1952,6 +2637,10 @@ class ReplayDirector:
         return {
             "locked": self.locked, "lockedReason": self.locked_reason,
             "replayActive": self.replay_active,
+            "replayEnabled": bool(self.replay_enabled),
+            "replayMode": self.replay_mode,
+            "captureArmed": bool(self._capture_disabled is False),
+            "memory": (self._memory_info or {}).get("hint", ""),
             "expectedHold": round(self.expected_hold, 2),
             "currentScene": self._current_scene,
             "clipReady": self._snapshot_ok,
@@ -2013,6 +2702,300 @@ def _setup_win_prototypes():
     u32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                    ctypes.c_size_t, ctypes.c_ssize_t]
     _PROTOTYPES_READY = True
+
+
+# ---------------------------------------------------------------------------
+# 4.5.1 可配置按键：键名 ←→ (vkCode, 扩展位)
+# ---------------------------------------------------------------------------
+# 键位不再写死在 make_manual_hook 里（用户 2026-10-07 要求"适应不同键盘"）。
+# config.json 的 "keys" 里存的是**字符串键名**，例如：
+#     "keys": {"mark_in": ["left"], "mark_out": ["right"],
+#              "save": ["numpad6"], "play": ["numpad_enter"]}
+# 换成没有小键盘的 60% 键盘：把 play 改成 ["f8"] 就行；每个动作也可以绑多个键。
+KEY_ACTIONS = {
+    "mark_in": "标记入点",
+    "mark_out": "标记出点 / 裁片段",
+    "save": "保留片段",
+    "play": "播放 / 收起回放",
+}
+
+KEY_TABLE = {
+    # --- 方向 / 编辑键 ---
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "insert": 0x2D, "delete": 0x2E, "backspace": 0x08, "tab": 0x09,
+    "space": 0x20, "esc": 0x1B, "escape": 0x1B, "capslock": 0x14,
+    "numlock": 0x90, "scrolllock": 0x91, "pause": 0x13, "printscreen": 0x2C,
+    # --- 符号键（主键盘）---
+    "backtick": 0xC0, "grave": 0xC0, "minus": 0xBD, "equal": 0xBB,
+    "lbracket": 0xDB, "rbracket": 0xDD, "backslash": 0xDC,
+    "semicolon": 0xBA, "quote": 0xDE, "comma": 0xBC, "period": 0xBE,
+    "slash": 0xBF,
+    # --- 小键盘（NumLock 灯亮着时才是这些码）---
+    "numpad0": 0x60, "numpad1": 0x61, "numpad2": 0x62, "numpad3": 0x63,
+    "numpad4": 0x64, "numpad5": 0x65, "numpad6": 0x66, "numpad7": 0x67,
+    "numpad8": 0x68, "numpad9": 0x69,
+    "numpad_multiply": 0x6A, "numpad_add": 0x6B, "numpad_subtract": 0x6D,
+    "numpad_decimal": 0x6E, "numpad_divide": 0x6F,
+    # --- 多媒体键（不同键盘差异大，但这三个最常见）---
+    "media_next": 0xB0, "media_prev": 0xB1, "media_play_pause": 0xB3,
+}
+for _i in range(10):
+    KEY_TABLE.setdefault(str(_i), 0x30 + _i)
+for _i in range(26):
+    KEY_TABLE.setdefault(chr(97 + _i), 0x41 + _i)
+for _i in range(1, 25):
+    KEY_TABLE.setdefault(f"f{_i}", 0x6F + _i)
+del _i
+
+# 主键盘 Enter 和小键盘 Enter 的 vkCode 都是 0x0D，只有这一族必须靠扩展位区分。
+_EXT_SENSITIVE = {0x0D: {"enter": False, "numpad_enter": True}}
+
+# 反向表：vkCode → 规范键名（显示 / 回写配置用；同码取最短名字）
+_KEY_BY_VK = {}
+for _name, _vk in KEY_TABLE.items():
+    if _vk not in _KEY_BY_VK or len(_name) < len(_KEY_BY_VK[_vk]):
+        _KEY_BY_VK[_vk] = _name
+del _name, _vk
+
+
+def key_token_name(vk, ext=None):
+    """(vkCode, 扩展位) → 配置里用的键名；认不出来就回 'vk:0x41' 这种写法。"""
+    vk = int(vk)
+    if vk == 0x0D and ext is not None:
+        return "numpad_enter" if ext else "enter"
+    name = _KEY_BY_VK.get(vk)
+    return name if name else f"vk:0x{vk:02X}"
+
+
+def parse_key_token(tok):
+    """键名 → (vkCode, 扩展位)。
+
+    扩展位为 **None** 表示"不区分扩展位"（方向键、字母数字等绝大多数键）；
+    0x0D 这一族返回 True/False（小键盘 Enter / 主键盘 Enter）。
+    也接受 "vk:0x41"、"0x41"、"65"（十进制）这类写法，方便手工写配置。
+    认不出来返回 None。
+    """
+    if tok is None:
+        return None
+    if isinstance(tok, (list, tuple)) and len(tok) == 2 and isinstance(tok[1], bool):
+        return (int(tok[0]), bool(tok[1]))          # 兼容旧的 (vk, ext) 写法
+    s = str(tok).strip().lower().replace(" ", "").replace("-", "_")
+    if not s:
+        return None
+    if s in KEY_TABLE:
+        return (KEY_TABLE[s], None)
+    # 容忍 "numpad_6" / "page_up" 这种带下划线的写法（图形界面/手写配置都可能出现）
+    if "_" in s and s.replace("_", "") in KEY_TABLE:
+        return (KEY_TABLE[s.replace("_", "")], None)
+    for vk, table in _EXT_SENSITIVE.items():
+        if s in table:
+            return (vk, table[s])
+    if s.startswith("vk:"):
+        s = s[3:]
+    try:
+        return (int(s, 16) if s.startswith("0x") else int(s, 10), None)
+    except ValueError:
+        return None
+
+
+def normalize_keys(cfg):
+    """把配置里的 "keys" 规范化。
+
+    返回 `(keys, problems)`：
+      * keys     —— `{动作: [规范键名, ...]}`，可直接显示 / 回写
+      * problems —— 中文问题列表，直接给用户看（认不出的键、两个动作抢同一个键…）
+
+    任何情况下都返回一份**能用的**键位表（认不出的退回默认值），
+    绝不因为配置写错就让四个键一起失灵。
+    """
+    raw = cfg.get("keys")
+    if isinstance(raw, dict) and "keys" in raw:      # 兼容误写成 {"keys": {...}} 两层
+        raw = raw.get("keys")
+    raw = raw if isinstance(raw, dict) else {}
+    defaults = DEFAULTS["keys"]
+    keys, problems, seen = {}, [], {}
+    for action in KEY_ACTIONS:
+        val = raw.get(action, defaults.get(action))
+        if val in (None, "", [], ()):
+            val = defaults.get(action)
+        toks = list(val) if isinstance(val, (list, tuple)) else [val]
+        if len(toks) == 2 and isinstance(toks[1], bool):     # 旧写法 (vk, ext)
+            toks = [toks]
+        out = []
+        for tok in toks:
+            parsed = parse_key_token(tok)
+            if parsed is None:
+                problems.append(f"按键「{tok}」不认识 → 已忽略")
+                continue
+            vk, ext = parsed
+            name = key_token_name(vk, ext)
+            if name in out:
+                continue                                     # 同一动作里重复，去重
+            other = seen.get(name)
+            if other:
+                problems.append(f"「{KEY_ACTIONS[other]}」和「{KEY_ACTIONS[action]}」都绑了 "
+                                f"{name} → 后者已忽略（一个键只能干一件事）")
+                continue
+            seen[name] = action
+            out.append(name)
+        if not out:
+            out = list(defaults.get(action) or [])
+            problems.append(f"「{KEY_ACTIONS[action]}」没有可用按键 → 已恢复默认 "
+                            f"{' / '.join(out)}")
+        keys[action] = out
+    return keys, problems
+
+
+def format_keys(keys):
+    """`{动作: [键名]}` → `{动作: 'left / f8'}`（给界面和日志显示）。"""
+    return {a: " / ".join(keys.get(a) or []) for a in KEY_ACTIONS}
+
+
+def binding_of_token(tok):
+    """键名 → KeyHook 用的绑定键：`int`（不区分扩展位）或 `(vk, ext)` 元组。"""
+    parsed = parse_key_token(tok)
+    if parsed is None:
+        return None
+    vk, ext = parsed
+    return vk if ext is None else (vk, bool(ext))
+
+
+# ---------------------------------------------------------------------------
+# 4.5.2 单次按键捕获（图形界面 / --set-keys 用）
+# ---------------------------------------------------------------------------
+# 临时装一个 WH_KEYBOARD_LL 钩子，抓到第一个"真正的键"就结束：
+#   * 修饰键（Shift/Ctrl/Alt/Win）不算 —— 按住 Shift 再按 F8，记的是 F8；
+#   * Esc = 取消；
+#   * 钩子同样是**只读**的，不拦截、不吞键。
+_CAPTURE_IGNORE_VK = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0x5D,
+                      0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+VK_ESCAPE = 0x1B
+
+
+class KeyCapture:
+    """单次按键捕获（Tk 里用 `after()` 轮询 `poll()`）。"""
+
+    def __init__(self, timeout=10.0):
+        self.timeout = float(timeout)
+        self._result = None
+        self._cancelled = False
+        self._done = threading.Event()
+        self._ready = threading.Event()
+        self._proc = None
+        self._hook = None
+        self._t0 = 0.0
+        self._thread = None
+        self.ok = False
+        self.error = ""
+
+    def _on_key(self, nCode, wParam, lParam):
+        try:
+            if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                vk, ext = int(kb.vkCode), bool(kb.flags & LLKHF_EXTENDED)
+                if self._result is None:
+                    if vk == VK_ESCAPE:
+                        self._result = "cancel"
+                    elif vk not in _CAPTURE_IGNORE_VK:
+                        self._result = (vk, ext)
+        except Exception:
+            pass
+        return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+    def _run(self):
+        try:
+            _setup_win_prototypes()
+            u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+            hmod = k32.GetModuleHandleW(None)
+            self._hook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, hmod, 0)
+            if not self._hook:
+                self._hook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, None, 0)
+            if not self._hook:
+                self.error = f"SetWindowsHookExW 失败 (GetLastError={k32.GetLastError()})"
+                self._ready.set()
+                self._done.set()
+                return
+            self.ok = True
+            self._t0 = time.time()
+            self._ready.set()
+            # 低级钩子靠线程消息队列分发，必须抽消息；用 PeekMessage + sleep
+            # 而不是阻塞的 GetMessage，好处是能顺便检查"超时/取消"。
+            msg = wintypes.MSG()
+            while not self._done.is_set():
+                if u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    u32.TranslateMessage(ctypes.byref(msg))
+                    u32.DispatchMessageW(ctypes.byref(msg))
+                else:
+                    time.sleep(0.02)
+                if self._result is not None or self._cancelled:
+                    self._done.set()
+                elif self.timeout > 0 and time.time() - self._t0 > self.timeout:
+                    self._done.set()
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            self.ok = False
+            self._ready.set()
+            self._done.set()
+        finally:
+            self._unhook()
+
+    def _unhook(self):
+        if self._hook:
+            try:
+                ctypes.windll.user32.UnhookWindowsHookEx(ctypes.c_void_p(self._hook))
+            except Exception:
+                pass
+            self._hook = None
+            self.ok = False
+
+    # ---------------- 对外接口 ----------------
+    def start(self):
+        _setup_win_prototypes()
+        self._proc = _HOOKPROC(self._on_key)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(4.0)
+        return self.ok
+
+    def poll(self):
+        """已捕获 → `(vkCode, 扩展位)`；还没按到 / 超时 / 取消 → None。"""
+        if self._done.is_set():
+            got = self._result if isinstance(self._result, tuple) else None
+            self._cleanup()
+            return got
+        if self.timeout > 0 and self._t0 and time.time() - self._t0 > self.timeout:
+            self.cancel()
+        return None
+
+    def cancel(self):
+        self._cancelled = True
+        self._done.set()
+        self._cleanup()
+
+    def _cleanup(self):
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.6)
+
+
+def capture_next_key(timeout=10.0, prompt=None, echo=True):
+    """命令行版：阻塞等一个键，返回 `(vk, ext)`；Esc / 超时返回 None。"""
+    cap = KeyCapture(timeout=timeout)
+    if prompt:
+        print(prompt, flush=True)
+    if not cap.start():
+        if echo:
+            print(f"❌ 装键盘钩子失败：{cap.error}", flush=True)
+        return None
+    try:
+        while not cap._done.is_set():
+            got = cap.poll()
+            if got is not None:
+                return got
+            time.sleep(0.05)
+        return cap.poll()
+    finally:
+        cap.cancel()
 
 
 class KeyHook:
@@ -2131,35 +3114,59 @@ class ManualController:
     def __init__(self, director):
         self.d = director
         self.hook = None
+        # 键名可以改（2026-10-07），所以日志里一律用**当前绑定的键**，别写死"小键盘 Enter"。
+        self.k = format_keys(normalize_keys(director.cfg)[0])
+
+    def key(self, action):
+        return self.k.get(action) or "?"
+
+    # ---------------- 回放功能总开关 ----------------
+    def _replay_off(self, what):
+        """回放功能关着的时候，四个键只提示不动手（用户 2026-10-07 定的默认值）。"""
+        if self.d.replay_enabled:
+            return False
+        log(f"   （回放功能当前是关的，{what} 不生效）")
+        log("     想用就在设置窗口 / 手机页面上打开「回放功能」；")
+        log("     提示器和自动切观察位不受这个开关影响，照常工作。")
+        return True
 
     # ---------------- ← 标记入点 ----------------
     def on_mark_in(self):
-        """记住"这一刻"当入点。只是记一个时间戳，不碰 OBS。"""
+        """记住"这一刻"当入点。只是记一个时间戳（+ 省内存模式下顺手开始攒帧）。"""
         d = self.d
+        if self._replay_off(f"【{self.key('mark_in')} 标记入点】"):
+            return
         if d.replay_active:
-            log("   （正在回放中，先按【小键盘 Enter】收掉再标入点）")
+            log(f"   （正在回放中，先按【{self.key('play')}】收掉再标入点）")
             return
         d.mark_in_at = time.time()
-        log(f"⏺  【← 标记入点】{time.strftime('%H:%M:%S')} —— "
-            f"打完了按【→ 标记出点】把这一段裁出来")
+        log(f"⏺  【{self.key('mark_in')} 标记入点】{time.strftime('%H:%M:%S')} —— "
+            f"打完了按【{self.key('mark_out')}】把这一段裁出来")
+        # ★ 省内存模式：平时插件是 Disable 的（不占内存），按 ← 才让它开始攒帧。
+        #   所以在这个模式下，片段是从**按 ← 这一刻**开始的（不能往回标）。
+        if d.replay_mode == "armed":
+            d.arm_capture("按了入点键")
 
     # ---------------- → 标记出点（当场裁片段）----------------
     def on_mark_out(self):
         """把"入点 → 现在"裁成一段素材（结尾就停在出点）。"""
         d = self.d
+        if self._replay_off(f"【{self.key('mark_out')} 标记出点】"):
+            return
         if d.replay_active:
-            log("   （正在回放中，先按【小键盘 Enter】收掉再标出点）")
+            log(f"   （正在回放中，先按【{self.key('play')}】收掉再标出点）")
             return
         mark = d.mark_in_at
         if not mark:
             # ★ 用户要求：没标入点就按 → 时**提示先按 ←，不要去抓一段没框过的画面**。
-            log("⚠️  还没标入点：先按【←】标入点，打完了再按【→】标出点")
+            log(f"⚠️  还没标入点：先按【{self.key('mark_in')}】标入点，"
+                f"打完了再按【{self.key('mark_out')}】标出点")
             return
         min_len = float(d.cfg.get("min_clip_seconds", 0.3))
         elapsed = time.time() - mark
         if elapsed < min_len:
             log(f"⚠️  入点到出点只有 {elapsed:.2f} 秒，太短了（至少 {min_len:.1f} 秒）"
-                f"—— 入点还留着，再按一次【→】就把这一段裁出来")
+                f"—— 入点还留着，再按一次【{self.key('mark_out')}】就把这一段裁出来")
             return
         # 守卫：没在拍游戏 → 缓冲里没有帧，裁出来会是空的或极短
         if d._current_scene and d._current_scene != d.cfg["live_scene"]:
@@ -2169,30 +3176,40 @@ class ManualController:
         try:
             d._load_replay(None, skip=skip)
         except Exception as e:
-            log(f"❌ 【→ 标记出点】裁片段失败: {e}")
+            log(f"❌ 【{self.key('mark_out')} 标记出点】裁片段失败: {e}")
             return
         d.mark_in_at = 0.0                      # 这一段用完了，下次重新标
         got = getattr(d, "last_clip_seconds", None)
-        log(f"⏹  【→ 标记出点】片段已裁好：入点到现在 {elapsed:.1f} 秒"
+        log(f"⏹  【{self.key('mark_out')} 标记出点】片段已裁好：入点到现在 {elapsed:.1f} 秒"
             + (f"，可播 {got:.1f} 秒" if got else ""))
-        log("    → 按【小键盘 Enter】切画面播放；想留档再按【小键盘 6】存成文件")
+        log(f"    → 按【{self.key('play')}】切画面播放；"
+            f"想留档再按【{self.key('save')}】存成文件")
+        # ★ 省内存模式：帧已经搬到"已取出的那一段"里了，这时候把滚动缓冲摘掉，
+        #   内存里就只剩最近这一段（用户 2026-10-07 要求："就留最近截取的片段"）。
+        if d.replay_mode == "armed" and d.cfg.get("free_buffer_after_clip", True):
+            d.release_capture("片段已裁好，收起滚动缓冲")
 
     def on_play(self):
         d = self.d
+        if self._replay_off(f"【{self.key('play')} 播放】"):
+            return
         if d.replay_active:
-            log("⏏  【小键盘 Enter】立刻切回直播")
+            log(f"⏏  【{self.key('play')}】立刻切回直播")
             d._end_replay("手动切回")
             return
         if not d._snapshot_ok:
-            log("⚠️  还没有裁好的片段 —— 先按【←】标入点，打完了按【→】标出点，再按播放")
+            log(f"⚠️  还没有裁好的片段 —— 先按【{self.key('mark_in')}】标入点，"
+                f"打完了按【{self.key('mark_out')}】标出点，再按播放")
             return
         # 不传长度：让引擎在锁内读**最新**的素材长度，避免用到旧的
-        log("▶  【小键盘 Enter】切画面播放")
+        log(f"▶  【{self.key('play')}】切画面播放")
         d._start_replay("手动播放", None)
 
     # ---------------- 小键盘 6：保留片段 ----------------
     def on_save(self):
         """把当前那段素材另存成文件（赛后能剪出去发）。"""
+        if self._replay_off(f"【{self.key('save')} 保留片段】"):
+            return
         self.d.save_replay()
 
 
@@ -2211,26 +3228,41 @@ def numlock_on():
         return None
 
 
-def make_manual_hook(controller, debounce=0.5):
+def make_manual_hook(controller, cfg=None, debounce=None):
     """
-    键位绑定（2026-10-06 起：手动框选片段，四个键）：
+    按配置里的键位表装钩子（2026-10-07 起键位可改，见 KEY_TABLE）。
 
-       ←  左方向键     标记入点
-       →  右方向键     标记出点（当场把"入点 → 现在"裁成一段素材）
-       小键盘 6        保留片段（把当前这段素材另存成文件，赛后能剪出去发）
-       小键盘 Enter    切画面播放 / 再按一次切回
+      标记入点      默认 ←  左方向键
+      标记出点      默认 →  右方向键（当场把"入点 → 现在"裁成一段素材）
+      保留片段      默认 小键盘 6（把这段素材另存成文件，赛后能剪出去发）
+      播放/收起     默认 小键盘 Enter
 
-    ★ 为什么"小键盘 6"没有连 `(VK_RIGHT, True)` 一起绑：
+    ★ 为什么"小键盘 6"默认没有连 `(VK_RIGHT, True)` 一起绑：
       方向键在 Windows 里**本身就带扩展位**（E0 前缀），NumLock 关掉时小键盘 6
       发出来的也是 `(VK_RIGHT, ext=True)`、scancode 同样是 0x4D —— 两者在底层
-      完全同码，钩子上区分不开。所以这里只认 NumLock 亮着时的 `VK_NUMPAD6`，
+      完全同码，钩子上区分不开。所以默认只认 NumLock 亮着时的 `VK_NUMPAD6`，
       免得把真正的 → 键劫持成"保留片段"（→ 是标出点键）。NumLock 没开时启动会提醒。
+
+    ★ 键位来自 `cfg["keys"]`（字符串键名），在图形界面或 `--set-keys` 里可以改；
+      没有小键盘的键盘可以把 play 改成 f8 之类。认不出的键会打日志并退回默认值。
     """
-    return KeyHook({VK_LEFT: controller.on_mark_in,
-                    VK_RIGHT: controller.on_mark_out,
-                    VK_NUMPAD6: controller.on_save,
-                    (VK_RETURN, True): controller.on_play},
-                   debounce=debounce)
+    cfg = cfg or {}
+    keys, problems = normalize_keys(cfg if "keys" in cfg else {"keys": DEFAULTS["keys"]})
+    for p in problems:
+        log(f"   ⚠️ 键位配置：{p}")
+    handlers = {"mark_in": controller.on_mark_in,
+                "mark_out": controller.on_mark_out,
+                "save": controller.on_save,
+                "play": controller.on_play}
+    bindings = {}
+    for action, toks in keys.items():
+        for tok in toks:
+            key = binding_of_token(tok)
+            if key is not None:
+                bindings[key] = handlers[action]
+    if debounce is None:
+        debounce = float(cfg.get("key_debounce", 0.5) or 0.5)
+    return KeyHook(bindings, debounce=debounce)
 
 
 # ============================================================================
@@ -2389,13 +3421,15 @@ def duel_win_prob(pa, pb, dist):
         return 0.0 if diff < 0 else 1.0
 
 
-def load_or_make_token():
+def load_or_make_token(base=None):
     """手机端开关自动切换需要一个口令，防止同网段的别人乱点。
 
     存在 viewer_token.txt 里，**重启后不变**，这样手机上的书签一直有效。
+    `base` 可以指定目录（图形界面和引擎必须指向同一个文件，否则手机上
+    预览到的地址和真正生效的口令会不一样）。
     """
     import secrets
-    p = os.path.join(base_dir(), "viewer_token.txt")
+    p = os.path.join(base or base_dir(), "viewer_token.txt")
     try:
         if os.path.exists(p):
             with open(p, encoding="utf-8") as f:
@@ -2704,6 +3738,330 @@ def send_digit(ch, tap_ms=28):
         return sent > 0
     except Exception:
         return False
+
+
+# ===========================================================================
+# 4.6 CS2 控制台"打字"（2026-10-07 加：每次开播前自动输入预设指令）
+# ===========================================================================
+# 用户要求："允许用户填写每次开播前在 cs 客户端控制台默认要输入的指令（支持多条）"。
+#
+# 做法：和自动切观察位**同一套** SendInput + 扫描码通路，只不过这次是逐字符打：
+#   1. 先按一下"控制台键"（默认 ` ，可以在设置里改成 F10 之类）把控制台打开；
+#   2. 等一小会儿（控制台是异步渲染的），然后每打一条指令就敲一次回车；
+#   3. 默认再把控制台关掉（跟手动操作一模一样）。
+#
+# 安全阀（和自动切视角同源）：
+#   * 默认**只有 CS2 在前台**才发键（`cs_console_require_focus`），
+#     否则这些字符会打进 OBS / 浏览器 / 聊天窗口；
+#   * 指令列表为空 = 这个功能完全不启动；
+#   * 只在引擎启动后自动发**一次**（或"每场第 1 回合"一次），不会反复刷。
+#
+# 键位表按**美式布局**（Set 1 扫描码）。CS2 控制台吃的是"按键产生的字符"，
+# 和系统输入法无关，但和**键盘布局**有关：非美式布局下个别符号可能对不上，
+# 所以日志里会把实际发出去的每一条原文回显出来，一眼能看出哪里不对。
+VK_SHIFT = 0x10
+SC_LSHIFT = 0x2A
+KEYEVENTF_EXTENDEDKEY = 0x0001
+
+
+def _build_char_scancode():
+    m = {}
+    # 主键盘 1..9,0
+    for i, ch in enumerate("123456789"):
+        m[ch] = (0x02 + i, False)
+    m["0"] = (0x0B, False)
+    # 字母三排
+    for row, start in (("qwertyuiop", 0x10), ("asdfghjkl", 0x1E), ("zxcvbnm", 0x2C)):
+        for i, ch in enumerate(row):
+            m[ch] = (start + i, False)
+            m[ch.upper()] = (start + i, True)
+    # 不按 Shift 的符号
+    for ch, sc in {"`": 0x29, "-": 0x0C, "=": 0x0D, "[": 0x1A, "]": 0x1B,
+                   "\\": 0x2B, ";": 0x27, "'": 0x28, ",": 0x33, ".": 0x34,
+                   "/": 0x35, " ": 0x39}.items():
+        m[ch] = (sc, False)
+    # 要按 Shift 的符号
+    for ch, sc in {"~": 0x29, "_": 0x0C, "+": 0x0D, "{": 0x1A, "}": 0x1B,
+                   "|": 0x2B, ":": 0x27, '"': 0x28, "<": 0x33, ">": 0x34,
+                   "?": 0x35, "!": 0x02, "@": 0x03, "#": 0x04, "$": 0x05,
+                   "%": 0x06, "^": 0x07, "&": 0x08, "*": 0x09, "(": 0x0A,
+                   ")": 0x0B}.items():
+        m[ch] = (sc, True)
+    return m
+
+
+CHAR_SCANCODE = _build_char_scancode()
+
+# 非字符键（给"控制台键"用；方向键/编辑键是扩展键，要带 E0 前缀）
+NAMED_SCANCODE = {
+    "esc": (0x01, False), "tab": (0x0F, False), "enter": (0x1C, False),
+    "numpad_enter": (0x1C, True), "backspace": (0x0E, False),
+    "space": (0x39, False), "backslash": (0x2B, False), "backtick": (0x29, False),
+    "f1": (0x3B, False), "f2": (0x3C, False), "f3": (0x3D, False), "f4": (0x3E, False),
+    "f5": (0x3F, False), "f6": (0x40, False), "f7": (0x41, False), "f8": (0x42, False),
+    "f9": (0x43, False), "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
+    "insert": (0x52, True), "delete": (0x53, True), "home": (0x47, True),
+    "end": (0x4F, True), "pageup": (0x49, True), "pagedown": (0x51, True),
+    "up": (0x48, True), "down": (0x50, True), "left": (0x4B, True), "right": (0x4D, True),
+    "numpad_divide": (0x35, True), "numpad_add": (0x4E, False),
+    "numpad_subtract": (0x4A, False), "numpad_decimal": (0x53, False),
+}
+for _i in range(10):
+    NAMED_SCANCODE.setdefault(f"numpad{_i}", (0x52 - _i if _i == 0 else 0x4F + _i, False))
+NAMED_SCANCODE["numpad0"] = (0x52, False)
+
+
+def send_key_scancode(sc, shift=False, tap_ms=14, extended=False):
+    """按一次扫描码（可选按住 Shift / 扩展位）。返回 True/False。"""
+    flags = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if extended else 0)
+    n = ctypes.sizeof(_INPUT)
+
+    def mk(up=False):
+        f = flags | (KEYEVENTF_KEYUP if up else 0)
+        return _INPUT(type=INPUT_KEYBOARD,
+                      u=_INPUTunion(ki=_KEYBDINPUT(0, sc, f, 0, None)))
+
+    shift_dn = _INPUT(type=INPUT_KEYBOARD,
+                      u=_INPUTunion(ki=_KEYBDINPUT(0, SC_LSHIFT, KEYEVENTF_SCANCODE, 0, None)))
+    shift_up = _INPUT(type=INPUT_KEYBOARD,
+                      u=_INPUTunion(ki=_KEYBDINPUT(0, SC_LSHIFT,
+                                                   KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0, None)))
+    try:
+        u32 = ctypes.windll.user32
+        u32.SendInput.restype = wintypes.UINT
+        u32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+        sent = 0
+        if shift:
+            sent += u32.SendInput(1, ctypes.byref(shift_dn), n)
+        down, up = mk(False), mk(True)
+        sent += u32.SendInput(1, ctypes.byref(down), n)
+        time.sleep(max(0.004, tap_ms / 1000.0))
+        sent += u32.SendInput(1, ctypes.byref(up), n)
+        if shift:
+            sent += u32.SendInput(1, ctypes.byref(shift_up), n)
+        return sent > 0
+    except Exception:
+        return False
+
+
+def type_text(text, per_char_ms=14):
+    """把一段文本"打"进当前焦点窗口。
+
+    返回 `(ok, bad_chars)`：bad_chars 是这张表里没有的字符（原样跳过，不中断），
+    调用方会把它们打进日志 —— 免得"少打了一个符号"这种问题现场看不出来。
+    """
+    bad = []
+    ok = True
+    for ch in text:
+        ent = CHAR_SCANCODE.get(ch)
+        if ent is None:
+            bad.append(ch)
+            ok = False
+            continue
+        sc, shift = ent
+        if not send_key_scancode(sc, shift, tap_ms=per_char_ms):
+            ok = False
+    return ok, bad
+
+
+def resolve_console_key(tok):
+    """把配置里的"控制台键"解析成 (scancode, shift, extended)；认不出返回 None。
+
+    既接受单个字符（`` ` `` / `'` / `\\` ），也接受键名（`f10` / `numpad_enter` / `backtick`）。
+    """
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    if len(s) == 1:
+        ent = CHAR_SCANCODE.get(s)
+        if ent:
+            return (ent[0], ent[1], False)
+    key = s.lower().replace(" ", "").replace("-", "_")
+    if key in NAMED_SCANCODE:
+        sc, ext = NAMED_SCANCODE[key]
+        return (sc, False, ext)
+    if "_" in key and key.replace("_", "") in NAMED_SCANCODE:
+        sc, ext = NAMED_SCANCODE[key.replace("_", "")]
+        return (sc, False, ext)
+    ent = CHAR_SCANCODE.get(s)
+    if ent:
+        return (ent[0], ent[1], False)
+    return None
+
+
+class ConsoleTyper:
+    """每次开播前自动往 CS2 控制台输入预设指令。
+
+    配置：
+      * `cs_console_commands`      —— 指令列表（一行一条，空行和 `//`、`;` 开头的注释行忽略）
+      * `cs_console_key`           —— 控制台键，默认 `` ` ``（可改 f10 之类）
+      * `cs_console_trigger`       —— `start`（引擎起来后等到 CS2 在前台就发一次，默认）
+                                      / `round1`（每场第 1 个冻结时间发一次）/ `manual`（只手动）
+      * `cs_console_delay_ms`      —— 打开控制台后等多久再开始打（默认 400）
+      * `cs_console_gap_ms`        —— 两条指令之间（默认 120）
+      * `cs_console_close`         —— 发完是否自动关掉控制台（默认 True）
+      * `cs_console_require_focus` —— 是否要求 CS2 在前台（默认 True，强烈建议保持）
+      * `cs_console_timeout_s`     —— `start` 模式下最多等多久（默认 900 秒）
+    """
+
+    def __init__(self, cfg, focus_exe="cs2.exe", dry_run=False):
+        self.cfg = cfg
+        self.focus_exe = str(cfg.get("auto_focus_exe") or "cs2.exe").lower()
+        self._lock = threading.Lock()
+        self._busy = False
+        self._last_sent = 0.0
+        self._stop = False
+        self.dry_run = bool(dry_run or cfg.get("dry_run"))
+        # 便于单测替换
+        self._fg = foreground_exe
+        self._type_text = type_text
+        self._tap_key = send_key_scancode
+        if self.dry_run:
+            # ★ 空跑模式（--dry-run）绝不能真往你桌面打字 —— 那会打进当前焦点窗口。
+            #   这里换成"只打日志"的桩，流程照样走完，方便离线验证。
+            self._tap_key = self._dry_tap
+            self._type_text = self._dry_type
+            self._fg = lambda: self.focus_exe      # 假装 CS2 在前台，好把流程走完
+
+    def _dry_tap(self, sc, shift=False, tap_ms=14, extended=False):
+        log(f"      [空跑] 按键 0x{sc:02X}{'（+Shift）' if shift else ''}")
+        return True
+
+    def _dry_type(self, text, per_char_ms=14):
+        log(f"      [空跑] 输入：{text}")
+        return True, []
+
+    # ---------------- 配置解析 ----------------
+    def commands(self):
+        """把配置里的指令整理成"要发出去的字符串列表"。"""
+        raw = self.cfg.get("cs_console_commands") or []
+        if isinstance(raw, str):
+            raw = raw.replace("\r\n", "\n").split("\n")
+        out = []
+        for line in raw:
+            s = str(line).strip()
+            if not s or s.startswith("//") or s.startswith(";"):
+                continue                                  # 空行 / 注释
+            out.append(s)
+        return out
+
+    def enabled(self):
+        return bool(self.commands()) and \
+            str(self.cfg.get("cs_console_trigger") or "start").lower() != "off"
+
+    def trigger(self):
+        t = str(self.cfg.get("cs_console_trigger") or "start").lower()
+        return t if t in ("start", "round1", "manual") else "start"
+
+    # ---------------- 真正发键 ----------------
+    def send_now(self, reason="手动", require_focus=None, wait_s=0.0):
+        """打开控制台 → 逐条输入 → （可选）关掉控制台。
+
+        `wait_s` > 0 时会先等 CS2 到前台（最多等这么久），`start` 模式用的就是它。
+        """
+        cmds = self.commands()
+        if not cmds:
+            log("   ℹ️ 没有配置 CS 控制台指令（cs_console_commands 是空的），跳过")
+            return False
+        if not self._lock.acquire(blocking=False):
+            log("   （上一条控制台指令还在输入中，这次跳过）")
+            return False
+        try:
+            self._busy = True
+            want_focus = (self.cfg.get("cs_console_require_focus", True)
+                          if require_focus is None else bool(require_focus))
+            ck = resolve_console_key(self.cfg.get("cs_console_key") or "`")
+            if ck is None:
+                log(f"   ❌ 控制台键「{self.cfg.get('cs_console_key')}」认不出来 —— "
+                    f"指令没发（可用：` 或 f10 / numpad_enter / backtick 这类键名）")
+                return False
+
+            if want_focus:
+                cur = self._fg()
+                if cur != self.focus_exe:
+                    if wait_s <= 0:
+                        log(f"   ⏸ 控制台指令没发：当前前台是「{cur or '未知'}」，"
+                            f"不是 {self.focus_exe}（等 CS2 到前台再发）")
+                        return False
+                    t0 = time.time()
+                    log(f"   ⏳ 等 CS2 到前台…（最多 {wait_s:.0f} 秒）")
+                    while time.time() - t0 < wait_s and not self._stop:
+                        if self._fg() == self.focus_exe:
+                            break
+                        time.sleep(0.5)
+                    else:
+                        log(f"   ⏸ 等了 {wait_s:.0f} 秒 CS2 也没到前台 —— 控制台指令没发")
+                        return False
+                    time.sleep(0.8)          # 刚切回游戏，给它一点时间
+
+            log(f"⌨  【CS 控制台指令】{reason}：开始输入 {len(cmds)} 条"
+                f"（控制台键 {self.cfg.get('cs_console_key') or '`'}）")
+            sc, shift, ext = ck
+            self._tap_key(sc, shift, tap_ms=40, extended=ext)
+            time.sleep(max(0.0, float(self.cfg.get("cs_console_delay_ms", 400)) / 1000.0))
+
+            gap = max(0.0, float(self.cfg.get("cs_console_gap_ms", 120)) / 1000.0)
+            for i, cmd in enumerate(cmds, 1):
+                ok, bad = self._type_text(cmd)
+                # 每条指令都敲一次回车，控制台才会执行
+                self._tap_key(0x1C, False, tap_ms=30)
+                flag = "" if ok else f"  ⚠️ 有字符没打出来：{' '.join(bad)}"
+                log(f"      [{i}/{len(cmds)}] {cmd}{flag}")
+                time.sleep(gap)
+            if self.cfg.get("cs_console_close", True):
+                self._tap_key(sc, shift, tap_ms=40, extended=ext)
+                log("      已关掉控制台")
+            self._last_sent = time.time()
+            log("   ✔ 控制台指令发送完毕")
+            return True
+        finally:
+            self._busy = False
+            self._lock.release()
+
+    # ---------------- 自动触发 ----------------
+    def start_auto(self):
+        """按 `cs_console_trigger` 起后台线程（`manual` 不动）。"""
+        cmds = self.commands()
+        if not cmds:
+            return
+        t = self.trigger()
+        if t == "manual":
+            log("⌨  CS 控制台指令：已配置 "
+                f"{len(cmds)} 条（触发时机=只手动 → 用设置窗口的「现在发送一次」或 "
+                f"http://127.0.0.1:{self.cfg.get('gsi_port')}/control/console）")
+            return
+        if t == "start":
+            wait_s = float(self.cfg.get("cs_console_timeout_s", 900) or 900)
+            threading.Thread(target=self._auto_start, args=(wait_s,), daemon=True).start()
+        else:      # round1：由 App.on_gsi 触发
+            log(f"⌨  CS 控制台指令：已配置 {len(cmds)} 条（触发时机=每场第 1 回合）")
+
+    def _auto_start(self, wait_s):
+        log(f"⌨  CS 控制台指令：已配置 {len(self.commands())} 条，"
+            f"等 CS2 到前台就自动输入（最多等 {wait_s:.0f} 秒）")
+        self.send_now("引擎启动后首次", wait_s=wait_s)
+
+    def on_gsi(self, phase, round_no):
+        """每场第 1 个冻结时间发一次（`round1` 模式）。"""
+        if self.trigger() != "round1" or not self.commands():
+            return
+        try:
+            rn = int(round_no or 0)
+        except Exception:
+            return
+        if rn != 1 or str(phase) not in ("freezetime", "live"):
+            return
+        # ⚠️ 冻结时间的 GSI 是 10Hz，而"发完一遍"要好几秒 —— 必须**先占位**再起线程，
+        #    否则第一条还没打完就会被下一个包再触发一次（自测抓到的 bug）。
+        #    30 分钟内只发一次，同一场比赛里 round 回到 1 也不会重复刷。
+        if self._busy or time.time() - self._last_sent < 1800:
+            return
+        self._last_sent = time.time()
+        threading.Thread(target=self.send_now, args=("第 1 回合开始",),
+                         daemon=True).start()
+
+    def stop(self):
+        self._stop = True
 
 
 class AutoSwitcher:
@@ -3211,6 +4569,23 @@ html,body{margin:0;padding:0;background:#0b0f14;color:#e8eef6;
 .pbtn.wb{font-size:13px}
 .pbtn.wb.on{background:#1e3a2a;border-color:#2f6f4f;color:#8ee6b0}
 
+/* ===== 回放功能开关（默认关；2026-10-07 加）===== */
+#featbox{background:#121922;border:1px solid #22303f;border-radius:14px;
+  padding:10px 12px;margin-bottom:10px}
+#featbtn{width:100%;border:none;border-radius:11px;padding:15px 10px;
+  font-size:22px;font-weight:800;letter-spacing:.5px;background:#2e3a48;color:#c8d8e8;
+  transition:background .15s}
+#featbtn.on{background:#4aa3ff;color:#04203a}
+#featbtn:active{transform:scale(.985)}
+#featstat{font-size:13px;color:#7d93a8;margin-top:7px;line-height:1.5}
+#featstat b{color:#9fb3c8;font-weight:600}
+#featstat .mem{color:#8ee6b0}
+#featwarn{display:none;font-size:13px;color:#ffc46b;margin-top:6px;line-height:1.5}
+#featwarn.on{display:block}
+#feattuner{margin-top:9px;padding-top:9px;border-top:1px solid #1f2a36}
+#feattuner .lbl{font-size:12px;color:#5d7a99;margin-bottom:5px}
+#feattuner .row2{display:flex;gap:6px}
+
 #warn{display:none;background:#3a2a10;border:1px solid #7a5a20;color:#ffc46b;
   border-radius:10px;padding:9px 11px;font-size:14px;margin-bottom:9px;line-height:1.5}
 #warn.on{display:block}
@@ -3276,6 +4651,19 @@ html,body{margin:0;padding:0;background:#0b0f14;color:#e8eef6;
 <div id="state"></div>
 <div id="clipbox"></div>
 
+<div id="featbox">
+  <button id="featbtn">回放功能：读取中…</button>
+  <div id="featstat">&nbsp;</div>
+  <div id="feattuner">
+    <div class="lbl">内存模式（省内存 = 按 ← 才开始攒帧，裁完就释放）</div>
+    <div class="row2">
+      <button class="pbtn" data-m="armed">省内存</button>
+      <button class="pbtn" data-m="buffer">常驻缓冲</button>
+    </div>
+  </div>
+  <div id="featwarn"></div>
+</div>
+
 <div id="autobox">
   <button id="autobtn">自动切换：读取中…</button>
   <div id="autostat">&nbsp;</div>
@@ -3319,6 +4707,62 @@ function needToken(){
   var w=document.getElementById('autowarn');
   w.className='on';
   w.textContent='这个页面没带口令，不能调自动切换。请用引擎窗口里打印的完整地址（带 ?k=...）。';
+}
+// ---------- 回放功能开关（默认关；开了才会响应 ← / → / 小键盘）----------
+var fbtn=document.getElementById('featbtn');
+function needTokenF(){
+  var w=document.getElementById('featwarn');
+  w.className='on';
+  w.textContent='这个页面没带口令，不能改回放功能。请用引擎窗口里打印的完整地址（带 ?k=...）。';
+}
+function tuneFeature(qs){
+  if(!TOKEN){ needTokenF(); return; }
+  fetch('/feature?k='+encodeURIComponent(TOKEN)+'&'+qs)
+    .then(function(r){return r.json();})
+    .then(function(j){ if(j&&j.ok){ paintFeature(j.feature); if(lastSnap){lastSnap.feature=j.feature; paintClip();} } })
+    .catch(function(){});
+}
+fbtn.onclick=function(){
+  if(!TOKEN){ needTokenF(); return; }
+  var want=fbtn.classList.contains('on')?0:1;
+  fbtn.textContent='回放功能：'+(want?'开':'关')+'（切换中…）';
+  tuneFeature('replay='+want);
+};
+Array.prototype.forEach.call(document.querySelectorAll('.pbtn[data-m]'),function(b){
+  b.onclick=function(){
+    if(!TOKEN){ needTokenF(); return; }
+    document.querySelectorAll('.pbtn[data-m]').forEach(function(x){x.className='pbtn';});
+    b.className='pbtn on';
+    tuneFeature('mode='+b.getAttribute('data-m'));
+  };
+});
+function paintFeature(f){
+  if(!f) return;
+  fbtn.className=f.enabled?'on':'';
+  fbtn.textContent='回放功能：'+(f.enabled?'开':'关');
+  document.querySelectorAll('.pbtn[data-m]').forEach(function(x){
+    x.className='pbtn'+((x.getAttribute('data-m')===f.mode)?' on':'');
+  });
+  var k=f.keys||{};
+  var s='';
+  if(f.enabled){
+    s+='← <b>'+esc(k.mark_in||'?')+'</b> 标入点　→ <b>'+esc(k.mark_out||'?')+
+       '</b> 裁片段　<b>'+esc(k.save||'?')+'</b> 留档　<b>'+esc(k.play||'?')+'</b> 播放<br>';
+    if(f.mode==='armed'){
+      s+='省内存模式：按 ← 才开始攒帧；裁完立即释放，内存里只留最近这一段。<br>';
+    } else {
+      s+='常驻缓冲：一直攒着最近 <b>'+f.seconds+'s</b>，可以往回标 ←。<br>';
+    }
+    s+='<span class="mem">内存：'+(f.armed?('正在攒帧 ≈ '+(f.oneCopyGB*2).toFixed(2)+' GB')
+                                        :('空闲 ≈ 0（上限 '+(f.oneCopyGB*2).toFixed(2)+' GB）'))+
+       '</span>';
+  } else {
+    s='关着的时候 ← / → / 保留片段 / 播放 <b>都不动手</b>，插件内存也还回去了。<br>'+
+      '提示器和自动切观察位<b>不受影响</b>，照常工作。<br>'+
+      '<span class="mem">开启后最多约 '+(f.steadyGB).toFixed(2)+' GB（'+
+      (f.mode==='armed'?'省内存模式，空闲时 ≈0':'常驻缓冲模式，一直占着')+'）</span>';
+  }
+  document.getElementById('featstat').innerHTML=s;
 }
 abtn.onclick=function(){
   if(!TOKEN){ needToken(); return; }
@@ -3381,10 +4825,31 @@ function paintClip(){
   var drift=(Date.now()-lastSnapAt)/1000;
   if(c.markAgo==null) clipStage=0;
   var buf=Number(c.bufMax||10).toFixed(0);
+  // 回放功能关着的时候，先说清楚"按了也不会动"，别让人以为按键坏了
+  if(c.enabled===false){
+    box.className='idle';
+    box.innerHTML='回放功能已关闭 —— 按 &larr; / &rarr; / 小键盘都不会动手（上面的开关可以打开）';
+    return;
+  }
   if(c.markAgo!=null){
     var ago=Number(c.markAgo)+drift;
     var left=Number(c.markLeft!=null?c.markLeft:0)-drift;
-    if(left<=0.2){
+    if(c.mode==='armed'){
+      // 省内存模式：缓冲从按 ← 那一刻开始攒，超上限才会覆盖开头
+      if(left<=0.2){
+        cls='dead';
+        h='<b>&#9888;&#65039; 攒帧超过 '+buf+' 秒了</b><br>开头会被覆盖，现在按 &rarr; '+
+          '会从 '+Number(c.avail||0).toFixed(1)+' 秒处开始';
+        if(clipStage<2){ clipStage=2;
+          if(vib&&navigator.vibrate) navigator.vibrate([120,90,120,90,120]); }
+      } else {
+        cls=(left<=2.5)?'soon':'arm';
+        h='<b>&#9193; 正在攒帧 '+(ago).toFixed(1)+' 秒</b><br>还能攒 '+left.toFixed(1)+
+          ' 秒（到 '+buf+' 秒就不再变长，现在按 &rarr; 就裁到这里）';
+        if(left<=2.5&&clipStage<1){ clipStage=1;
+          if(vib&&navigator.vibrate) navigator.vibrate([70,80,70]); }
+      }
+    } else if(left<=0.2){
       cls='dead';
       h='<b>&#9888;&#65039; 入点已经滚出缓冲</b><br>现在按 &rarr; 只能给你最近 '+
         Number(c.avail||0).toFixed(1)+' 秒（起点不是入点）';
@@ -3402,15 +4867,20 @@ function paintClip(){
         ' 秒内按 &rarr;（缓冲 '+buf+' 秒）';
     }
   } else if(c.replayActive){
-    cls='play'; h='&#9654; 正在回放…（按小键盘 Enter 收掉再标下一段）';
+    cls='play'; h='&#9654; 正在回放…（按播放键收掉再标下一段）';
   } else if(c.clipReady){
+    var kk2=(d.feature&&d.feature.keys)||{};
     cls='ok';
     h='&#9989; 片段已裁好'+(c.clipAgo!=null?('（'+Math.round(Number(c.clipAgo)+drift)+' 秒前）'):'')+
       (c.lastClipSec?(' 长 '+Number(c.lastClipSec).toFixed(1)+' 秒'):'')+
-      '<br>小键盘 Enter 播　·　小键盘 6 存文件';
+      '<br>按 <b>'+esc(kk2.play||'播放键')+'</b> 播　·　按 <b>'+esc(kk2.save||'留档键')+'</b> 存文件';
   } else {
+    var kk3=(d.feature&&d.feature.keys)||{};
     cls='idle';
-    h='先按 &larr; 标入点，打完在 '+buf+' 秒内按 &rarr;';
+    h=(c.mode==='armed')
+      ? ('按 <b>'+esc(kk3.mark_in||'←')+'</b> 开始攒帧（省内存模式：不按就不占内存）')
+      : ('先按 <b>'+esc(kk3.mark_in||'←')+'</b> 标入点，打完在 '+buf+' 秒内按 <b>'+
+         esc(kk3.mark_out||'→')+'</b>');
   }
   box.className=cls; box.innerHTML=h;
 }
@@ -3437,6 +4907,7 @@ function render(d){
   document.getElementById('state').innerHTML=pills.join('');
 
   paintAuto(d.auto);
+  paintFeature(d.feature);
 
   var w=document.getElementById('warn');
   if(d.hasKeys===false){
@@ -3537,9 +5008,28 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             wb = None
             if q.get("winbonus"):
                 wb = (q.get("winbonus") or ["1"])[0] in ("1", "true", "on", "yes")
-            st = self.app.set_auto(on=on, preset=preset, win_bonus=wb)
+            nm = None
+            if q.get("names"):
+                nm = (q.get("names") or ["1"])[0] in ("1", "true", "on", "yes")
+            st = self.app.set_auto(on=on, preset=preset, win_bonus=wb, names=nm)
             self._send(200, "application/json; charset=utf-8",
                        json.dumps({"ok": True, "auto": st}, ensure_ascii=False).encode("utf-8"))
+            return
+        if path == "/feature":
+            # ★ 回放功能总开关 / 内存模式（默认关、默认省内存）。
+            #   和 /auto 一样要口令：这是"会动 OBS"的开关。
+            tok = (q.get("k") or [""])[0]
+            if not self.app.viewer_token or tok != self.app.viewer_token:
+                self._send(403, "application/json; charset=utf-8",
+                           b'{"ok":false,"error":"bad token"}')
+                return
+            replay = None
+            if q.get("replay"):
+                replay = (q.get("replay") or ["0"])[0] in ("1", "true", "on", "yes")
+            mode = (q.get("mode") or [None])[0]
+            st = self.app.set_feature(replay=replay, mode=mode)
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps({"ok": True, "feature": st}, ensure_ascii=False).encode("utf-8"))
             return
         if path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", VIEWER_HTML.encode("utf-8"))
@@ -3609,6 +5099,7 @@ class App:
         self.attention.show_names = bool(cfg.get("show_names", False))
         self.auto = AutoSwitcher(cfg)       # 自动切换视角
         self.attention.win_bonus = self.auto.win_bonus
+        self.console = ConsoleTyper(cfg, dry_run=simulate or bool(cfg.get("dry_run")))
         self.viewer_token = ""
         self._snap_json = None
         self.web = None
@@ -3620,6 +5111,11 @@ class App:
     def on_gsi(self, payload):
         self.state.on_gsi(payload)
         self.director.on_gsi_tick(self.state.phase)
+        # CS 控制台指令：round1 模式下，每场第 1 个冻结时间发一次
+        try:
+            self.console.on_gsi(self.state.phase, self.state.live_round)
+        except Exception:
+            pass
         # 副驾提示器 + 自动切换：每个包都重算一次（10 人 × 10Hz，开销可忽略）
         try:
             snap = self.attention.update(payload)
@@ -3627,17 +5123,62 @@ class App:
             snap["auto"] = self.auto.state()
             # 片段框选状态（← 入点还剩几秒、片段裁好没有）—— 手机页面顶部那条横幅
             snap["clip"] = self.director.mark_window()
+            snap["feature"] = self.feature_state()
             self._snap_json = json.dumps(snap, ensure_ascii=False)
         except Exception:
             log("!! 提示器/自动切换计算出错:\n" + traceback.format_exc())
 
-    def set_auto(self, on=None, preset=None, win_bonus=None):
+    def feature_state(self):
+        """回放功能开关 / 内存模式的状态（手机页面的大开关用）。"""
+        d = self.director
+        info = d.memory_info()
+        return {
+            "enabled": bool(d.replay_enabled),
+            "mode": d.replay_mode,
+            "armed": bool(d._capture_disabled is False),
+            "seconds": float(d.cfg.get("record_max_seconds", 10.0) or 10.0),
+            "oneCopyGB": info["one_copy_gb"],
+            "steadyGB": info["steady_gb"],
+            "memory": info["hint"],
+            "keys": format_keys(normalize_keys(d.cfg)[0]),
+        }
+
+    def set_feature(self, replay=None, mode=None):
+        """手机页面 / GUI 改「回放功能」开关与内存模式（立即生效 + 写回配置）。"""
+        d = self.director
+        if mode is not None:
+            d.set_replay_mode(mode, persist=False)
+        if replay is not None:
+            d.set_replay_enabled(replay, persist=False)
+        if replay is not None or mode is not None:
+            d.persist_config()
+        st = self.feature_state()
+        if self._snap_json:
+            try:
+                s = json.loads(self._snap_json)
+                s["feature"] = st
+                s["clip"] = d.mark_window()
+                self._snap_json = json.dumps(s, ensure_ascii=False)
+            except Exception:
+                pass
+        return st
+
+    def set_auto(self, on=None, preset=None, win_bonus=None, names=None):
         if preset is not None:
             self.auto.apply_preset(preset)
         if win_bonus is not None:
             self.auto.set_win_bonus(win_bonus)
         if on is not None:
             self.auto.set_enabled(on)
+        if names is not None:
+            # ★ 2026-10-07：手机页面上那个「显示名字」原来是**每台手机自己的本地开关**，
+            #   现在服务端也能设（图形界面 / 命令行），并且会写回 config.json。
+            #   手机上的本地开关仍然可以覆盖它（现场想看名字就点一下）。
+            self.attention.show_names = bool(names)
+            self.cfg["show_names"] = bool(names)
+            log(f"👁 提示器显示名字 → {'开' if names else '关'}"
+                f"（手机页面上的同名开关是每台设备自己的，会覆盖这里）")
+            self.director.persist_config()
         # 胜率加成是作用在**排序**上的，所以要让提示器模型也同步
         self.attention.win_bonus = self.auto.win_bonus
         if self._snap_json:
@@ -3675,6 +5216,10 @@ class App:
             return False
         self.controller.on_mark_out()
         return True
+
+    def send_console(self, reason="手动"):
+        """手动发一次 CS 控制台指令（设置窗口按钮 / /control/console）。"""
+        return self.console.send_now(reason)
 
     def start_web_server(self):
         cfg = self.cfg
@@ -3925,10 +5470,14 @@ def run_test_load_replay(cfg):
 def run_test_keys(cfg):
     log("=== 热键测试 ===")
     log("请依次按这四个键，窗口里会实时打印。按 Ctrl+C 结束。")
-    log("   ←  左方向键（标记入点）")
-    log("   →  右方向键（标记出点：把入点到现在裁成一段）")
-    log("   小键盘 6（保留片段）")
-    log("   小键盘 Enter（切画面播放；不是主键盘那个大的 Enter）")
+    keys, problems = normalize_keys(cfg)
+    shown = format_keys(keys)
+    for action, label in KEY_ACTIONS.items():
+        log(f"   {shown[action]:<20}（{label}）")
+    for p in problems:
+        log(f"   ⚠️ 键位配置：{p}")
+    if not cfg.get("replay_enabled", False):
+        log("   ⛔ 注意：回放功能当前是关闭的，引擎不会动手；这里只测键盘钩子本身。")
     nl = numlock_on()
     if nl is None:
         log("   （读不到 NumLock 状态）")
@@ -3936,7 +5485,8 @@ def run_test_keys(cfg):
         log("   NumLock：✅ 亮着 —— 小键盘 6 和 → 是两个不同的键，互不干扰")
     else:
         log("   NumLock：❌ 关着 —— 现在小键盘 6 和 → 发的是同一个按键，"
-            "两个都会走「→ 标记出点」。请按一下 NumLock 让灯亮起来再测。")
+            "两个都会走「标记出点」。请按一下 NumLock 让灯亮起来再测，"
+            "或者把这两个键改到主键盘上。")
 
     def mk(label, is_target):
         def f():
@@ -3944,13 +5494,20 @@ def run_test_keys(cfg):
             log(f"   收到: {label}  {tag}")
         return f
 
-    hook = KeyHook({
-        VK_LEFT: mk("← 左方向键", True),
-        VK_RIGHT: mk("→ 右方向键", True),
-        VK_NUMPAD6: mk("小键盘 6 / 保留片段", True),
-        (VK_RETURN, True): mk("小键盘 Enter", True),
-        VK_RETURN: mk("主键盘 Enter", False),
-    }, debounce=0.25)
+    bindings = {}
+    for action, toks in keys.items():
+        for tok in toks:
+            key = binding_of_token(tok)
+            if key is not None:
+                bindings[key] = mk(f"{tok}（{KEY_ACTIONS[action]}）", True)
+    # 顺便认一下常见的"没绑上的键"，省得用户以为绑了却没反应
+    for extra in (VK_RETURN, VK_LEFT, VK_RIGHT, VK_NUMPAD6, (VK_RETURN, True)):
+        if isinstance(extra, tuple):
+            nm = key_token_name(extra[0], extra[1])
+        else:
+            nm = key_token_name(extra, None)
+        bindings.setdefault(extra, mk(f"{nm}（未绑定的键）", False))
+    hook = KeyHook(bindings, debounce=0.25)
     if not hook.start():
         log(f"❌ 钩子安装失败: {hook.error}")
         return 1
@@ -4017,6 +5574,76 @@ def run_probe(cfg):
     obs.close()
     log("=== 探测完成 ===")
     return 0
+
+
+def run_selftest(cfg=None):
+    """自检：这份程序（尤其是打包好的 exe）在**这台电脑**上到底能不能跑。
+
+    为什么要有：2026-10-07 实测踩到 —— 打包机上没装 `websocket-client` 时，
+    PyInstaller 的 `--hidden-import websocket` 只是**静默跳过**，打出来的 exe
+    双击能开、但一连 OBS 就 `RuntimeError: 缺少 websocket-client`。
+    别人拿到就是"用不了"，而且完全看不出原因。所以：
+      * `build_exe.py` 打包前后各查一次（见那边）；
+      * 这里也给用户一个能自己跑的 `--selftest`。
+    """
+    log("=== 自检（这份程序能不能跑）===")
+    ok = True
+
+    # 1) websocket-client：连 OBS 的硬依赖
+    try:
+        import websocket
+        log(f"✅ websocket-client {getattr(websocket, '__version__', '?')}"
+            f"（连 obs-websocket 必需）")
+    except Exception as e:
+        ok = False
+        log(f"❌ 缺 websocket-client：{e}")
+        log("   · 源码运行：  pip install websocket-client")
+        log("   · 成品 exe：  这是**打包那台机器**漏了它（build_exe.py 现在会提前拦下）")
+
+    # 2) tkinter：图形设置窗口（不是硬需求，没有也能 --no-gui 跑）
+    try:
+        import tkinter
+        log(f"✅ tkinter {tkinter.TkVersion}（图形设置窗口可用）")
+    except Exception as e:
+        log(f"⚠️  没有 tkinter（{e}）：打不开设置窗口，用 --no-gui / 6-director.cmd 也行。")
+
+    # 3) 纯逻辑自检：键位表 + 内存公式（这两个错了会静默出洋相）
+    try:
+        keys, problems = normalize_keys({"keys": DEFAULTS["keys"]})
+        shown = format_keys(keys)
+        log(f"✅ 键位表可用：{shown}"
+            + (f"（{len(problems)} 条提示）" if problems else ""))
+        m = estimate_replay_memory(1920, 1080, 60, 10, 2)
+        log(f"✅ 内存公式：1080p60 10 秒两份 = {m['steady_gb']:.2f} GB"
+            f"（应该 ≈9.95）")
+        if abs(m["steady_gb"] - 9.95) > 0.1:
+            ok = False
+            log("❌ 内存公式和文档对不上，别用！")
+    except Exception as e:
+        ok = False
+        log(f"❌ 基本逻辑自检失败：{type(e).__name__}: {e}")
+
+    # 4) 平台 / 路径
+    log(f"   平台：{sys.platform} / Python {sys.version.split()[0]}"
+        f"{'（打包版）' if getattr(sys, 'frozen', False) else '（源码）'}")
+    log(f"   程序目录：{base_dir()}")
+    log(f"   配置文件：{CONFIG_PATH or os.path.join(base_dir(), 'config.json')}"
+        f"{'' if CONFIG_PATH and os.path.exists(CONFIG_PATH) else '（还不存在 → 先跑首次设置向导）'}")
+    try:
+        log(f"   手机口令文件：{os.path.join(base_dir(), 'viewer_token.txt')}")
+    except Exception:
+        pass
+
+    log("")
+    if ok:
+        log("✅ 自检通过。还差的外部条件（这些不在这份程序里）：")
+        log("   · OBS Studio 30+ 且开着 obs-websocket；")
+        log("   · exeldro/obs-replay-source 插件（回放功能靠它）；")
+        log("   · CS2 装在**同一台**电脑上（GSI 只推到 127.0.0.1）；")
+        log("   · 首次设置向导跑过一次（会写 GSI 配置 + 放行防火墙）。")
+    else:
+        log("❌ 自检没通过 —— 先解决上面标 ❌ 的条目，否则连不上 OBS。")
+    return 0 if ok else 3
 
 
 # ---------------------------------------------------------------------------
@@ -4099,6 +5726,13 @@ def run_simulate(cfg):
     cfg = dict(cfg)
     cfg["min_score"] = 25
     cfg["verbose"] = True
+    # ★ 仿真要跑"回放能不能用"的全套回归，所以这里显式打开回放功能
+    #   （真实默认值是关的，2026-10-07 起；关掉的行为另有专门的回归段落）。
+    cfg["replay_enabled"] = True
+    # 仿真跑在 armed（省内存）模式下：按入点键才 Enable，裁完 Disable ——
+    # 这条通路在真题里没测过，用仿真先把调用顺序验一遍。
+    cfg.setdefault("replay_mode", "armed")
+    log(f"（仿真设置：replay_enabled=True，replay_mode={cfg['replay_mode']}）")
 
     obs = NullObsClient(scenes=[cfg["live_scene"], cfg["replay_scene"], "bp"],
                         items={cfg["replay_scene"]: [
@@ -4227,6 +5861,103 @@ def run_simulate(cfg):
     got = app.director.counters["rounds"] - base
     log(f"  25 个 freezetime 包 → 触发 {got} 次回合结束  (期望 1)")
 
+    # --- 2026-10-07 新增：可改按键 / 回放开关 / 省内存模式 ---
+    log("")
+    log("──────── 可改按键：解析、冲突、兜底 ────────")
+    k1, p1 = normalize_keys({"keys": {"mark_in": ["left"], "mark_out": ["right"],
+                                      "save": ["numpad6"], "play": ["numpad_enter"]}})
+    log(f"  默认键位 → {format_keys(k1)}  (问题 {len(p1)} 个，期望 0)")
+    k2, p2 = normalize_keys({"keys": {"mark_in": ["f8", "9"], "mark_out": ["f8"],
+                                      "save": ["不存在的键"], "play": ["numpad_enter"]}})
+    log(f"  自定义+冲突+错键 → {format_keys(k2)}")
+    log(f"  问题 {len(p2)} 个（期望 4：f8 冲突、mark_out 无键退回默认、错键、save 退回默认）：")
+    for _p in p2:
+        log(f"      · {_p}")
+    log(f"  parse_key_token('numpad_enter') = {parse_key_token('numpad_enter')}"
+        f"  (期望 (13, True))")
+    log(f"  parse_key_token('enter')        = {parse_key_token('enter')}"
+        f"  (期望 (13, False))")
+    log(f"  binding_of_token('left')        = {binding_of_token('left')}  (期望 37，不区分扩展位)")
+
+    log("")
+    log("──────── 内存估算（纯计算）────────")
+    _m = estimate_replay_memory(1920, 1080, 60, 10, 2)
+    log(f"  1080p60 10 秒 × 2 份 = {_m['steady_gb']:.2f} GB  (期望 ≈9.95)")
+    _m2 = estimate_replay_memory(3840, 2160, 60, 10, 2)
+    log(f"  4K60    10 秒 × 2 份 = {_m2['steady_gb']:.2f} GB  (期望 ≈39.8)")
+    _m3 = memory_estimate_from_cfg({"replay_mode": "armed", "record_max_seconds": 10})
+    log(f"  省内存模式提示：{_m3['hint']}")
+
+    log("")
+    log("──────── 回放功能默认关闭：四个键不动手 + 插件被 Disable ────────")
+    obs.calls.clear()                       # 只数这一段之后的调用
+    app.director.set_replay_enabled(False, persist=False)
+    for fn, label in ((ctl.on_mark_in, "mark_in"), (ctl.on_mark_out, "mark_out"),
+                      (ctl.on_play, "play"), (ctl.on_save, "save")):
+        fn()
+    n_load = sum(1 for c in obs.calls if c[0] == "TriggerHotkeyByName" and c[1]
+                 and c[1].get("hotkeyName") == "ReplaySource.Replay")
+    log(f"  关着的时候按四个键 → 触发 Load replay 次数 = {n_load}  (期望 0)")
+    hk = [c[1].get("hotkeyName") for c in obs.calls
+          if c[0] == "TriggerHotkeyByName" and c[1]]
+    log(f"  关掉时发出的插件热键：{hk}  (期望含 ReplaySource.Disable)")
+    log(f"  replayEnabled = {app.director.replay_enabled}  (期望 False)")
+
+    log("")
+    log("──────── 省内存模式：按入点键才 Enable，裁完立刻 Disable ────────")
+    app.director.set_replay_enabled(True, persist=False)
+    app.director.set_replay_mode("armed", persist=False)
+    obs.calls.clear()
+    ctl.on_mark_in()
+    hk1 = [c[1].get("hotkeyName") for c in obs.calls
+           if c[0] == "TriggerHotkeyByName" and c[1]]
+    log(f"  按入点键后插件热键：{hk1}  (期望含 ReplaySource.Enable)")
+    time.sleep(0.6)
+    obs.calls.clear()
+    ctl.on_mark_out()
+    hk2 = [c[1].get("hotkeyName") for c in obs.calls
+           if c[0] == "TriggerHotkeyByName" and c[1]]
+    log(f"  按出点键后插件热键：{hk2}  (期望含 ReplaySource.Replay，且之后是 Disable)")
+    log(f"  captureArmed = {app.director._capture_disabled is False}  (期望 False = 已收起缓冲)")
+    log(f"  skip = {app.director.clip_skip_from_mark(time.time() - 2.0)}"
+        f"  (省内存模式下趁早按 → 期望 0.0)")
+    _w = app.director.mark_window()
+    log(f"  mark_window: mode={_w.get('mode')} enabled={_w.get('enabled')} "
+        f"expired={_w.get('expired')}")
+    app.director.set_replay_enabled(False, persist=False)
+
+    log("")
+    log("  ℹ️ 基线说明：核心流程计数器（rounds/replays/skipped/interrupted/hold_warnings）")
+    log("     应与历史基线一致 —— rounds 7, replays 3, skipped 7, interrupted 1, hold_warnings 2；")
+    log("     而 snapshots 从 1 变成 2：多的那 1 次是本段「省内存模式」回归自己裁的片段。")
+    log("")
+    log("──────── CS 控制台指令：解析 + 安全阀 + 时序（用桩，不真的发按键）────────")
+    _c = ConsoleTyper({"cs_console_commands": ["sv_cheats 1", "", "// 注释",
+                                               "mp_freezetime 5"],
+                       "cs_console_key": "`", "cs_console_trigger": "start",
+                       "cs_console_delay_ms": 1, "cs_console_gap_ms": 1}, )
+    log(f"  解析出 {len(_c.commands())} 条指令：{_c.commands()}"
+        f"  (期望 2：空行和 // 注释被忽略)")
+    _c._fg = lambda: "obs64.exe"
+    _sent = []
+    _c._tap_key = lambda *a, **k: _sent.append(a) or True
+    _c._type_text = lambda *a, **k: (True, [])
+    log(f"  CS2 不在前台时 send_now = {_c.send_now('仿真')}  (期望 False)")
+    log(f"  实际发出的按键数 = {len(_sent)}  (期望 0 —— 安全阀生效)")
+    _c._fg = lambda: "cs2.exe"
+    _seq = []
+    _c._tap_key = lambda sc, shift=False, tap_ms=0, extended=False: _seq.append(
+        f"0x{sc:02X}") or True
+    _c._type_text = lambda text, per_char_ms=14: _seq.append(text) or (True, [])
+    _c.send_now("仿真")
+    log(f"  前台是 CS2 时的顺序：{_seq}")
+    log(f"    (期望：0x29 开控制台 → 指令 → 0x1C 回车 → 指令 → 0x1C → 0x29 关控制台)")
+    log(f"  parse_key/控制台键：resolve_console_key('`') = {resolve_console_key('`')}"
+        f"  resolve_console_key('f10') = {resolve_console_key('f10')}")
+    log(f"  字符表：A → {CHAR_SCANCODE['A']}（期望 shift=True）"
+        f"  _ → {CHAR_SCANCODE['_']}（期望 shift=True）"
+        f"  a → {CHAR_SCANCODE['a']}（期望 shift=False）")
+
     log("")
     log("=== 仿真结果 ===")
     log(json.dumps(app.status(), ensure_ascii=False, indent=2))
@@ -4270,41 +6001,63 @@ def run_live(cfg, manual_only=False):
 
     # ★ 手动键盘控制（唯一的工作方式：手动框选片段）
     ctl = None
-    if cfg.get("manual_keys", True) and not cfg["dry_run"]:
+    if cfg.get("manual_keys", True):
         ctl = ManualController(app.director)
         app.controller = ctl          # 让 HTTP 端点 /control/mark_in|mark_out 也走同一套逻辑
-        hook = make_manual_hook(ctl, debounce=float(cfg.get("key_debounce", 0.4)))
-        if hook.start():
-            ctl.hook = hook
+        if cfg["dry_run"]:
+            # 空跑模式不装钩子（不该真的监听你的键盘），但控制器**要建**：
+            # 这样 /control/mark_in|mark_out|replay 能驱动完整流程，方便离线验证。
             log("")
-            log("⌨  全局热键已启用（只读监听，不拦截按键）：")
-            log("      ←  左方向键      标记入点（记住这一刻）")
-            log(f"      →  右方向键      标记出点：把「入点 → 现在」裁成一段素材"
-                f"（缓冲最长 {cfg.get('record_max_seconds')} 秒，所以要在 "
-                f"{cfg.get('record_max_seconds')} 秒内按）")
-            log("      小键盘 Enter     切到「即时回放」播放；再按一次立刻切回")
-            if cfg.get("save_replay_key", True):
-                log("      小键盘 6         保留片段（把当前这段素材另存成文件）"
-                    f" → {cfg.get('save_dir') or 'OBS 录制目录'}")
-            log("      ★ 引擎不做任何自动定格：不按 → 就没有新素材。")
-            nl = numlock_on()
-            if nl is False:
-                log("      ⚠️ NumLock 灯是灭的：小键盘 6 和 → 发的是同一个按键，"
-                    "现在按小键盘 6 只会当「标记出点」。")
-                log("         想让「保留片段」生效，请按一下 NumLock 让灯亮起来。")
+            log("⌨  空跑模式：不装键盘钩子（不会监听你的按键），但可以用 HTTP 端点驱动：")
+            log("      /control/mark_in | /control/mark_out | /control/replay | /control/status")
         else:
-            log(f"⚠️  全局热键安装失败：{hook.error}")
-            log("    可以用浏览器控制端点代替：/control/mark_in /mark_out /replay")
+            hook = make_manual_hook(ctl, cfg)
+            if hook.start():
+                ctl.hook = hook
+                kk = ctl.k
+                log("")
+                log("⌨  全局热键已启用（只读监听，不拦截按键）：")
+                log(f"      {kk['mark_in']:<16}标记入点（记住这一刻）")
+                if app.director.replay_mode == "armed":
+                    log(f"      {kk['mark_out']:<16}标记出点：把「入点 → 现在」裁成一段素材"
+                        f"（省内存模式：攒帧从按入点键开始，最长 {cfg.get('record_max_seconds')} 秒）")
+                else:
+                    log(f"      {kk['mark_out']:<16}标记出点：把「入点 → 现在」裁成一段素材"
+                        f"（缓冲最长 {cfg.get('record_max_seconds')} 秒，所以要在 "
+                        f"{cfg.get('record_max_seconds')} 秒内按）")
+                log(f"      {kk['play']:<16}切到「即时回放」播放；再按一次立刻切回")
+                if cfg.get("save_replay_key", True):
+                    log(f"      {kk['save']:<16}保留片段（把当前这段素材另存成文件）"
+                        f" → {cfg.get('save_dir') or 'OBS 录制目录'}")
+                log("      ★ 键位可以改（图形界面 / --set-keys），配错也能在 config.json 的 keys 里手动写。")
+                log("      ★ 引擎不做任何自动定格：不按出点键就没有新素材。")
+                if not app.director.replay_enabled:
+                    log("      ⛔ 回放功能当前是**关闭**的：上面四个键只提示不动手。")
+                    log("         想用就在设置窗口 / 手机页面上打开「回放功能」。")
+                nl = numlock_on()
+                if nl is False and ("numpad6" in kk.values() or "numpad_enter" in kk.values()):
+                    log("      ⚠️ NumLock 灯是灭的：小键盘 6 和 → 发的是同一个按键，"
+                        "现在按小键盘 6 只会当「标记出点」。")
+                    log("         想让「保留片段」生效，请按一下 NumLock 让灯亮起来，"
+                        "或者把这两个键改到主键盘上（设置窗口里点「修改」按一下就行）。")
+            else:
+                log(f"⚠️  全局热键安装失败：{hook.error}")
+                log("    可以用浏览器控制端点代替：/control/mark_in /mark_out /replay")
 
     app.start_gsi_server()
     app.start_web_server()
     tick = threading.Thread(target=app.director.ticker, daemon=True)
     tick.start()
+    # ★ CS 控制台指令：按 cs_console_trigger 自动发（start=等 CS2 到前台发一次）
+    try:
+        app.console.start_auto()
+    except Exception:
+        log("!! 启动 CS 控制台指令出错:\n" + traceback.format_exc())
 
     log("")
     log("就绪。把 gamestate_integration_director.cfg 放进 CS2 的 game/csgo/cfg/ 目录，")
     log("然后启动 CS2 观战即可。控制端点: /control/status | /lock | /unlock | /replay"
-        " | /mark_in | /mark_out")
+        " | /mark_in | /mark_out | /console")
     log("按 Ctrl+C 退出。")
     try:
         while True:
@@ -4344,6 +6097,26 @@ def parse_args():
                    help="用假 OBS 跑，只打日志不切场景（纯逻辑验证）")
     p.add_argument("--manual-only", action="store_true",
                    help="连真 OBS，但只响应手动 /control/replay，不自动触发（安全验证 OBS 通路）")
+    # ★ 2026-10-07：图形界面 / 回放开关 / 按键
+    p.add_argument("--gui", action="store_true", help="打开图形设置窗口（双击 exe 的默认行为）")
+    p.add_argument("--engine", "--run", dest="engine", action="store_true",
+                   help="正常跑引擎（图形界面用它拉起子进程；不带 GUI）")
+    p.add_argument("--no-gui", action="store_true",
+                   help="即使没带参数也走命令行引擎，不开图形界面（脚本里用）")
+    p.add_argument("--replay", choices=["on", "off"], help="回放功能总开关（默认关）")
+    p.add_argument("--mode", choices=["armed", "buffer"],
+                   help="内存模式：armed=省内存（按入点键才攒帧，默认）；buffer=常驻滚动缓冲")
+    p.add_argument("--memory-report", action="store_true",
+                   help="只做内存体检：按画布/时长算出回放插件占多少内存，然后退出")
+    p.add_argument("--show-keys", action="store_true", help="打印当前键位后退出")
+    p.add_argument("--selftest", action="store_true",
+                   help="自检这份程序能不能跑（缺 websocket-client / tkinter / 键位表 / 内存公式）")
+    p.add_argument("--set-keys", action="store_true",
+                   help="交互式改键：按一下你要用的键就绑上（默认会写回 config.json）")
+    p.add_argument("--bind", action="append", metavar="动作=键名[,键名]",
+                   help="直接改键，可重复：--bind play=f8 --bind save=f9,numpad6")
+    p.add_argument("--save-bind", action="store_true",
+                   help="把 --bind / --replay / --mode 的改动写回 config.json")
     # 常用覆盖
     p.add_argument("--gsi-port", type=int)
     p.add_argument("--obs-url")
@@ -4359,8 +6132,121 @@ def parse_args():
     return p.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# 5.x 按键设置 / 内存体检 / 图形界面（2026-10-07 加）
+# ---------------------------------------------------------------------------
+
+def apply_bind_args(cfg, binds):
+    """把 `--bind play=f8` 这类参数应用到 `cfg["keys"]` 上。
+
+    返回 `(keys, problems)`；键名认不出来只报告不动手（绝不悄悄绑错键）。
+    """
+    keys, problems = normalize_keys(cfg)
+    problems = list(problems)
+    for item in binds or []:
+        if "=" not in str(item):
+            problems.append(f"--bind 参数「{item}」格式不对，应该写成 动作=键名")
+            continue
+        action, val = str(item).split("=", 1)
+        action = action.strip().lower()
+        if action not in KEY_ACTIONS:
+            problems.append(f"--bind 里的动作「{action}」不认识；"
+                            f"可用：{'/'.join(KEY_ACTIONS)}")
+            continue
+        toks = [t.strip() for t in val.replace(" ", ",").split(",") if t.strip()]
+        parsed = [(t, parse_key_token(t)) for t in toks]
+        bad = [t for t, p in parsed if p is None]
+        if bad or not toks:
+            problems.append(f"--bind {action}= 里的键名不认识：{'/'.join(bad) or '(空)'}")
+            continue
+        keys[action] = [key_token_name(*p) for _, p in parsed]
+    cfg["keys"] = keys
+    return keys, problems
+
+
+def print_keys(cfg):
+    keys, problems = normalize_keys(cfg)
+    shown = format_keys(keys)
+    log("当前键位（图形界面里点「修改」按一下就能改，或 --bind 动作=键名）：")
+    for action, label in KEY_ACTIONS.items():
+        log(f"    {label:<18} {shown[action]}")
+    for p in problems:
+        log(f"    ⚠️ {p}")
+    log("小提示：没有小键盘的键盘（60%）可以把「播放 / 收起回放」改成 f8、"
+        "「保留片段」改成 f9 —— 在图形界面里按一下就绑上。")
+
+
+def run_set_keys(cfg, cfg_path, save=True):
+    """交互式改键：四个动作各按一下你要用的键（Esc / 超时 = 跳过）。"""
+    keys, _ = normalize_keys(cfg)
+    shown = format_keys(keys)
+    log("")
+    log("=== 改键：每个动作按一下你要用的键（Esc 跳过这个动作）===")
+    log(f"当前：{shown}")
+    for action, label in KEY_ACTIONS.items():
+        print(f"\n【{label}】当前是 {shown[action]} —— 请按你要用的键"
+              f"（Esc 跳过 / 10 秒不按也跳过）：", flush=True)
+        got = capture_next_key(timeout=10.0, echo=False)
+        if got is None:
+            print("    跳过（保持原样）", flush=True)
+            continue
+        vk, ext = got
+        name = key_token_name(vk, ext)
+        print(f"    捕获到：{name}（vkCode=0x{vk:02X}，扩展位={int(bool(ext))}）", flush=True)
+        keys[action] = [name]
+    cfg["keys"] = keys
+    keys, problems = normalize_keys(cfg)      # 再规范化一次：查冲突 / 兜底
+    cfg["keys"] = keys
+    for p in problems:
+        log(f"    ⚠️ {p}")
+    print("\n新的键位：" + str(format_keys(keys)), flush=True)
+    if save and cfg_path:
+        save_config(cfg, cfg_path)
+        print(f"已写回 {cfg_path}（引擎下次启动生效；图形界面里改是立即生效）", flush=True)
+    return 0
+
+
+def run_memory_report(cfg, dry_run=False):
+    """内存体检：把"回放插件到底占多少内存"算清楚（能连 OBS 就用真画布）。"""
+    log("=== 回放插件内存体检 ===")
+    obs = NullObsClient() if dry_run else ObsClient(cfg["obs_url"], cfg["obs_password"])
+    connected = False
+    if not dry_run:
+        try:
+            obs.connect()
+            connected = True
+            log("✅ 已连上 obs-websocket，用真实画布参数算")
+        except Exception as e:
+            log(f"⚠️  连不上 obs-websocket（{e}）—— 用 1920x1080@60 估算")
+    d = ReplayDirector(cfg, obs)
+    try:
+        if connected:
+            d._memory_audit()
+        else:
+            info = d.memory_info()
+            log(f"    画布/帧率：{info['width']}x{info['height']} @ {info['fps']:g}fps"
+                f"（每帧 {info['frame_mb']:.1f} MB，每秒 {info['mb_per_sec']:.0f} MB）")
+            log(f"    单段 {info['seconds']:.1f} 秒 → 一份 ≈ {info['one_copy_gb']:.2f} GB，"
+                f"稳态 {info['copies']:g} 份 ≈ {info['steady_gb']:.2f} GB")
+        info = d.memory_info()
+        log("")
+        log("结论：**不是内存泄漏** —— obs-replay-source 把最近 N 秒的未压缩帧放在内存里")
+        log("      （画布宽 × 高 × 4 字节 × 帧率 × 秒数）。省内存模式（armed）下只有按了")
+        log("      入点键才攒帧、裁完立刻释放；回放功能关闭时插件被 Disable，")
+        log("      滚动缓冲那份内存直接还回去。")
+        log(f"      想更省：record_max_seconds 从 {info['seconds']:.0f} 秒调小（减半省一半），"
+            "或把画布/帧率降一档。")
+        return 0
+    finally:
+        try:
+            obs.close()
+        except Exception:
+            pass
+
+
+
 def main():
-    global LOG_FILE
+    global LOG_FILE, CONFIG_PATH
     # 打包后只有这一个 exe：用 --setup 触发首次设置向导。
     # 必须放在 parse_args() 之前 —— 向导自己还有 --dry-run / --check 要接。
     if "--setup" in sys.argv[1:]:
@@ -4375,16 +6261,8 @@ def main():
     args = parse_args()
     if args.log_file:
         LOG_FILE = args.log_file
-    cfg = dict(DEFAULTS)
-    cfg_path = args.config
-    if not cfg_path:
-        # 打包成 exe 双击运行时没人给它 --config，自动认旁边的 config.json
-        cand = os.path.join(base_dir(), "config.json")
-        if os.path.exists(cand):
-            cfg_path = cand
-    if cfg_path:
-        with open(cfg_path, encoding="utf-8") as f:
-            cfg.update(json.load(f))
+    cfg, cfg_path = load_config(args.config)
+    CONFIG_PATH = cfg_path
     for a in ("gsi_port", "obs_url", "obs_password", "live_scene", "replay_scene",
               "replay_item", "min_score", "capture_seconds", "speed"):
         v = getattr(args, a, None)
@@ -4394,11 +6272,51 @@ def main():
         cfg["verbose"] = False
     cfg["dry_run"] = bool(args.dry_run)
 
+    # ★ 2026-10-07：命令行改键 / 回放开关 / 内存模式（GUI 与手机页面也走同一套字段）
+    did_setup = False
+    if args.bind:
+        _, problems = apply_bind_args(cfg, args.bind)
+        for p in problems:
+            log(f"⚠️ {p}")
+    if args.replay is not None:
+        cfg["replay_enabled"] = (args.replay == "on")
+    if args.mode is not None:
+        cfg["replay_mode"] = args.mode
+    if (args.bind or args.replay is not None or args.mode is not None) and args.save_bind:
+        cfg_path = save_config(cfg, cfg_path) or cfg_path
+        CONFIG_PATH = cfg_path
+        log(f"已把设置写回 {cfg_path}")
+
+    if args.show_keys:
+        print_keys(cfg)
+        return 0
+    if args.selftest:
+        return run_selftest(cfg)
+    if args.set_keys:
+        return run_set_keys(cfg, cfg_path, save=True)
+    if args.memory_report:
+        return run_memory_report(cfg, dry_run=args.dry_run)
+
+    # ★ 双击 exe / 不带任何参数 = 打开图形设置窗口（用户 2026-10-07 要求"为整个程序增加 GUI"）。
+    #   带明确动作参数（--simulate / --probe / --engine / ...）时仍然走命令行，
+    #   这样 6-director.cmd 之类的脚本行为**完全不变**。
+    wants_gui = args.gui or (not args.no_gui and not args.engine
+                             and len(sys.argv) <= 1)
+    if wants_gui:
+        try:
+            import director_gui
+        except Exception as e:
+            print(f"⚠️  打不开图形界面（{e}）—— 改用命令行模式。")
+            print("    想强制命令行：  开始导播.exe --no-gui")
+            wants_gui = False
+        else:
+            return director_gui.main([])
+
     # 全新电脑上双击 exe：旁边没有 config.json，也没让它干具体活
     # → 直接把「首次设置向导」拉起来，真正做到开箱即用。
     no_action = not any([args.test_keys, args.probe, args.test_load_replay,
                          args.check_replay_source, args.configure_replay_source,
-                         args.simulate, args.manual_only, args.dry_run])
+                         args.simulate, args.manual_only, args.dry_run, args.engine])
     if no_action and not cfg_path:
         print("=" * 66)
         print("  这台电脑还没做过首次设置（旁边没有 config.json）。")
@@ -4408,6 +6326,7 @@ def main():
         try:
             import setup_wizard
             rc = setup_wizard.main([])
+            did_setup = True
         except Exception:
             print("自动配置没能跑起来。手动运行：  开始导播.exe --setup")
             traceback.print_exc()
@@ -4418,8 +6337,8 @@ def main():
             return rc
         cand = os.path.join(base_dir(), "config.json")
         if os.path.exists(cand):          # 配好了，读回来继续启动
-            with open(cand, encoding="utf-8") as f:
-                cfg.update(json.load(f))
+            cfg, _ = load_config(cand)
+            CONFIG_PATH = cand
 
     if args.test_keys:
         return run_test_keys(cfg)
@@ -4432,6 +6351,8 @@ def main():
                              apply=args.configure_replay_source and args.apply)
     if args.simulate:
         return run_simulate(cfg)
+    if did_setup:
+        log("首次设置完成 —— 接着启动引擎。想改按键/回放开关，双击 exe 打开设置窗口。")
     return run_live(cfg, manual_only=args.manual_only)
 
 

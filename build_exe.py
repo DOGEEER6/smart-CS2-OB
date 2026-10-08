@@ -10,6 +10,9 @@
   文件夹版   CS2导播助手\\开始导播.exe      （旁边还有 _internal\\ 和 先运行我-首次设置.cmd）
   单文件版   开始导播.exe                   （就一个文件）
 
+双击「开始导播.exe」= 图形设置窗口（2026-10-07 起）；窗口里点「启动引擎」才开始导播。
+命令行用法完全不变：`开始导播.exe --engine` 直接跑引擎（6-director.cmd 走的就是这条）。
+
 为什么默认是文件夹版？
   单文件版每次启动都要把自己解压到 %TEMP%，遇到杀软/组策略会被拦
   （报 "Could not create temporary directory!"），而且每次启动慢 1 秒左右。
@@ -34,19 +37,21 @@ try:  # 中文 Windows 下被重定向时 stdout 是 GBK，打 ✅ 会直接崩
 except Exception:
     pass
 
-ENTRY = "replay_director.py"          # 唯一入口，--setup 也在里面
+ENTRY = "replay_director.py"          # 唯一入口，--setup / --gui 也在里面
 INNER = "cs2_dir_engine"              # PyInstaller 内部名（ASCII，避免奇怪问题）
 EXE_NAME = "开始导播.exe"
 FOLDER_NAME = "CS2导播助手"
 ONEFILE_NAME = "开始导播.exe"
 
 # 用不到的大家伙，排掉能小一圈
-EXCLUDES = ["tkinter", "unittest", "pydoc", "doctest", "test", "distutils",
+# ⚠️ tkinter 不能排！2026-10-07 起图形设置窗口（director_gui.py）要用它。
+EXCLUDES = ["unittest", "pydoc", "doctest", "test", "distutils",
             "lib2to3", "numpy", "PIL", "matplotlib", "pandas", "scipy",
             "PyQt5", "PySide2", "setuptools", "pip"]
 
-# setup_wizard 是在 main() 里延迟 import 的，PyInstaller 静态分析看不到它
-HIDDEN = ["websocket", "setup_wizard"]
+# setup_wizard / director_gui 都是在 main() 里延迟 import 的，
+# PyInstaller 静态分析看不到它们 → 必须显式 --hidden-import。
+HIDDEN = ["websocket", "setup_wizard", "director_gui"]
 
 FIRST_RUN_CMD = """@echo off
 chcp 65001 >nul
@@ -65,6 +70,8 @@ echo    5. 放行手机访问（会弹一次 UAC 授权框，点"是"）
 echo.
 echo  配置已经好过的话，重新跑一遍也不会有任何改动。
 echo.
+echo  ★ 想改按键 / 开关回放功能：双击「开始导播.exe」打开设置窗口。
+echo.
 pause
 if not exist "开始导播.exe" (
   echo 找不到 开始导播.exe —— 请确认它和本文件在同一个文件夹里。
@@ -78,6 +85,60 @@ pause
 
 # 跟着成品一起发出去的说明/工具
 EXTRAS = ["使用说明.md", "8-allow-phone.cmd", "导播流程卡.md"]
+
+
+def preflight_deps():
+    """打包前：确认这台机器上真的有运行时必需的东西。
+
+    ⚠️ 2026-10-07 实测踩到的坑：打包机没装 `websocket-client` 时，
+    PyInstaller 的 `--hidden-import websocket` **只是打个警告就跳过**，
+    打出来的 exe 双击能开、一连 OBS 就 `RuntimeError: 缺少 websocket-client` ——
+    别人拿到就是"用不了"，还看不出原因。所以这里必须**硬拦**。
+    """
+    missing = []
+    try:
+        import websocket  # noqa: F401
+        print(f"  ✅ websocket-client "
+              f"{getattr(websocket, '__version__', '?')}（连 OBS 必需，会被打进 exe）")
+    except Exception as e:
+        missing.append(f"websocket-client（{e}）")
+    try:
+        import tkinter  # noqa: F401
+        print(f"  ✅ tkinter {tkinter.TkVersion}（图形设置窗口必需，会被打进 exe）")
+    except Exception as e:
+        print(f"  ⚠️  没有 tkinter（{e}）—— 打出来的包将**打不开设置窗口**，"
+              f"只能用命令行。建议装一个带 tkinter 的官方 Python 再打包。")
+    if missing:
+        print()
+        print("❌ 缺运行时依赖，打出来的 exe 会在别人电脑上直接报错：")
+        for m in missing:
+            print(f"     · {m}")
+        print("   先装：  python -m pip install websocket-client")
+        return False
+    return True
+
+
+def verify_built_exe(exe_path):
+    """打包后：直接拿产物跑一次自检（`--selftest`），确认关键依赖真的进去了。"""
+    if not os.path.isfile(exe_path):
+        print(f"  ❌ 找不到产物 {exe_path}")
+        return False
+    try:
+        r = subprocess.run([exe_path, "--selftest"], cwd=os.path.dirname(exe_path),
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
+    except Exception as e:
+        print(f"  ❌ 跑不起来：{e}")
+        return False
+    out = (r.stdout or "") + (r.stderr or "")
+    for line in out.splitlines():
+        if any(k in line for k in ("✅", "❌", "⚠️")):
+            print("     " + line.strip())
+    if r.returncode != 0:
+        print(f"  ❌ 产物自检没通过（退出码 {r.returncode}）—— 别发出去。")
+        return False
+    print("  ✅ 产物自检通过（websocket-client / tkinter / 键位表 / 内存公式都在）")
+    return True
 
 
 def copy_extras(dest_dir):
@@ -115,11 +176,22 @@ def pyinstaller_args(mode, distpath):
     return cmd
 
 
+def _rmtree_or_die(path, what):
+    """删掉旧产物；删不掉就说清楚原因（最常见的是产物还开着）。"""
+    if not os.path.isdir(path):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.isdir(path):
+        print(f"❌ 删不掉旧的{what}：{path}")
+        print("   最常见的原因：正在运行的「开始导播.exe」（或它的设置窗口）没关。")
+        print("   关掉它再跑一次；也可以在任务管理器里结束「开始导播」进程。")
+        raise SystemExit(2)
+
+
 def build_onedir():
     """打成一个自包含的文件夹，直接落在项目目录里。"""
     out = os.path.join(HERE, FOLDER_NAME)
-    if os.path.isdir(out):
-        shutil.rmtree(out, ignore_errors=True)
+    _rmtree_or_die(out, "成品文件夹")
     r = run(pyinstaller_args("onedir", HERE))
     if r.returncode != 0:
         return None, r.returncode
@@ -127,8 +199,7 @@ def build_onedir():
     if not os.path.isdir(src_dir):
         print(f"❌ 没生成 {src_dir}")
         return None, 1
-    if os.path.isdir(out):
-        shutil.rmtree(out, ignore_errors=True)
+    _rmtree_or_die(out, "成品文件夹")
     os.rename(src_dir, out)
 
     src_exe = os.path.join(out, INNER + ".exe")
@@ -192,10 +263,15 @@ def main():
         print(f"❌ 找不到 {ENTRY}")
         return 2
 
+    print()
+    print("打包前检查运行环境：")
+    if not preflight_deps():
+        return 2
+
     t0 = time.time()
     print()
     print("=" * 66)
-    print(f"打包（{mode} 版）—— 引擎 + 首次设置在同一个程序里")
+    print(f"打包（{mode} 版）—— 引擎 + 图形设置窗口 + 首次设置都在同一个程序里")
     print("=" * 66)
     built, rc = (build_onedir() if mode == "onedir" else build_onefile())
     if rc != 0:
@@ -203,6 +279,12 @@ def main():
         return rc
 
     out, exe, size = built
+    print()
+    print("打包后自检产物（拿真的 exe 跑一次 --selftest）：")
+    if not verify_built_exe(exe):
+        print()
+        print("⚠️  产物自检没过 —— 请把上面的输出发出来，先别把它拷给别人。")
+        return 3
     print()
     print("=" * 66)
     print(f"✅ 打包完成，用了 {time.time() - t0:.0f} 秒")
@@ -213,14 +295,15 @@ def main():
         print(f"  双击这个  : {exe}")
         print()
         print("  第一次用：先双击文件夹里的「先运行我-首次设置.cmd」")
-        print("  之后每次：双击「开始导播.exe」")
+        print("  之后每次：双击「开始导播.exe」打开设置窗口，点「启动引擎」开始导播")
+        print("            （不想开窗口就跑命令行：开始导播.exe --engine）")
         print()
         print("  注意：整个文件夹一起拷走才能用（别只拷 exe）。")
     else:
         print(f"  成品: {out}   {size:.1f} MB")
         print()
         print("  第一次用：双击「先运行我-首次设置.cmd」")
-        print("  之后每次：双击「开始导播.exe」")
+        print("  之后每次：双击「开始导播.exe」打开设置窗口，点「启动引擎」开始导播")
         print()
         print("  单文件版拷到任何 Windows 电脑都能跑，不需要装 Python。")
         print("  如果它报 “Could not create temporary directory”，")
