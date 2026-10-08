@@ -186,6 +186,17 @@ DEFAULTS = {
         "save": ["numpad6"],
         "play": ["numpad_enter"],
     },
+    # ★ 按键监听方式（2026-10-08 加）：
+    #   "hook"（默认）= 全局低级键盘钩子 WH_KEYBOARD_LL。精确（能区分主/小键盘 Enter），
+    #                   但低级钩子有个特性：**回调返回之前，全系统的键盘都在排队**。
+    #                   引擎的钩子回调已经改成"只入队、不阻塞"（微秒级），正常机器没问题；
+    #                   但如果机器本身在换页/被杀软拖住，仍可能让输入发顿。
+    #   "poll"        = `GetAsyncKeyState` 轮询（key_poll_ms，默认 20ms）。
+    #                   **完全不进入输入管线**，物理上不可能拖住键盘 —— 排查
+    #                   "一开这软件整机就像死机"时，先切到这个模式做对照。
+    #                   代价：认不出主/小键盘 Enter 的区别（要区分就把 play 改成 f8）。
+    "key_mode": "hook",
+    "key_poll_ms": 20,
 
     # ★ 2026-10-07 用户要求：**回放功能做成可开关，默认关闭**。
     #   关掉时：← / → / 小键盘6 / 小键盘Enter 四个键只提示、不动手，
@@ -214,6 +225,12 @@ DEFAULTS = {
     #   系统换页到整机失去响应、OBS 被拖死、只能长按电源键。
     #   想自己承担风险就设 false（不推荐）。
     "memory_guard": True,
+    # ★ 资源哨兵（2026-10-08 加，默认开）：引擎运行期间每 ~2 秒看一眼可用内存，
+    #   低于 low_mem_warn_pct 打警告，低于 low_mem_release_pct 就**主动把回放插件的
+    #   滚动缓冲放掉**（先把我们占的几 GB 还回去），免得整机换页卡死、直播跟着卡。
+    "resource_watch": True,
+    "low_mem_warn_pct": 12.0,
+    "low_mem_release_pct": 6.0,
     # 体检发现 Maximum replays > 1 / Capture internal frames = 开 时，自动写回正确值
     "memory_autofix": True,
     # ★ 提前多久切回直播场景。现在默认 **0**：改由插件在片子结束那一帧触发切回
@@ -499,6 +516,17 @@ def canvas_from_obs_config():
     return None
 
 
+def disk_free_gb(path):
+    """某个路径所在盘还剩多少 GB（读不到返回 None）。"""
+    try:
+        if not path:
+            return None
+        drive = os.path.splitdrive(os.path.abspath(path))[0] or "C:"
+        return shutil.disk_usage(drive + os.sep).free / 1e9
+    except Exception:
+        return None
+
+
 def memory_budget_gb(total_gb, avail_gb):
     """回放缓冲允许吃掉多少内存：总内存的 30%，且不超过当前可用内存的 60%。"""
     if not total_gb:
@@ -507,6 +535,26 @@ def memory_budget_gb(total_gb, avail_gb):
     if avail_gb:
         cap = min(cap, max(0.5, float(avail_gb) * 0.60))
     return cap
+
+
+def resource_pressure(avail_gb, total_gb, warn_pct=12.0, release_pct=6.0):
+    """按"可用内存占比"判断当前压力：`"ok"` / `"warn"` / `"release"`。
+
+    2026-10-08 加：用户报"正在直播时整机卡死、直播间也卡死" —— 这类"全都卡住"
+    基本就是系统级资源耗尽（换页风暴），而**受害者是整台机器**，不只是我们。
+    所以引擎要当"哨兵"：
+      * `warn`    → 打一条带数字的警告（谁在吃内存、建议怎么降）；
+      * `release` → **主动把回放插件的滚动缓冲放掉**（`ReplaySource.Disable`），
+                    先把我们自己占的那几 GB 还回去，别等系统崩。
+    """
+    if not total_gb or total_gb <= 0 or avail_gb is None:
+        return "ok"
+    pct = float(avail_gb) / float(total_gb) * 100.0
+    if pct <= float(release_pct):
+        return "release"
+    if pct <= float(warn_pct):
+        return "warn"
+    return "ok"
 
 
 def plan_replay_seconds(width, height, fps, want_seconds, total_gb, avail_gb,
@@ -1264,6 +1312,9 @@ class ReplayDirector:
         self._capture_armed_at = 0.0     # armed 模式：上次让插件开始攒帧的时刻
         self._capture_disabled = None    # None=还不知道；True=插件当前是 Disable 状态
         self._memory_info = {}           # 最近一次内存体检的原始数据
+        self._watch_tick = 0             # 资源哨兵的计数器（ticker 每 50ms +1）
+        self._mem_alert = ""             # 上次的内存警告级别（ok/warn/release）
+        self._mem_alert_at = 0.0
         self._config_path = CONFIG_PATH
         # 人工接管锁的自动过期
         self._locked_at = 0.0
@@ -1560,6 +1611,15 @@ class ReplayDirector:
             except Exception:
                 pass
             return False
+        # 磁盘也要看一眼（页面文件在系统盘，写满了同样会"整机不可用"）
+        if not self._check_disk_space():
+            self.replay_enabled = False
+            cfg["replay_enabled"] = False
+            try:
+                self.release_capture("磁盘护栏：系统盘快满")
+            except Exception:
+                pass
+            return False
         log(f"      → 已自动把单段素材上限从 {want:.1f} 秒降到 **{safe:.1f} 秒**"
             f"（≈{info['width'] * info['height'] * 4 * info['fps'] * safe / 1e9 * 2:.2f} GB 峰值）")
         log("        不想让它自动降：config.json 里把 memory_guard 设成 false（不建议）")
@@ -1569,6 +1629,32 @@ class ReplayDirector:
                 self.persist_config()
             except Exception:
                 pass
+        return True
+
+    def _check_disk_space(self):
+        """磁盘写满也会"整机不可用"：页面文件在系统盘，回放留档也往盘上写。
+
+        返回 True = 还行；False = 系统盘快满了（拒绝开回放）。
+        """
+        cfg = self.cfg
+        sys_drive = os.environ.get("SystemDrive", "C:") + os.sep
+        free_sys = disk_free_gb(sys_drive)
+        save_dir = str(cfg.get("save_dir") or "").strip()
+        free_save = disk_free_gb(save_dir) if save_dir else None
+        os.makedirs  # noqa: B018  （只是提示：这里不建目录）
+        if free_sys is None and free_save is None:
+            return True
+        if free_sys is not None:
+            if free_sys < 2.0:
+                log(f"   ❌ 磁盘护栏：系统盘 {sys_drive} 只剩 {free_sys:.1f} GB ——"
+                    f" 页面文件都写不进去，整机会卡死/报错。先清理磁盘再开回放。")
+                return False
+            if free_sys < 8.0:
+                log(f"   ⚠️ 磁盘护栏：系统盘 {sys_drive} 只剩 {free_sys:.1f} GB，"
+                    f"页面交换会更吃力（机器内存吃紧时尤其明显）——建议先清一点空间。")
+        if free_save is not None and free_save < 5.0:
+            log(f"   ⚠️ 磁盘护栏：留档目录所在盘只剩 {free_save:.1f} GB，"
+                f"按小键盘 6 存片段可能写到没空间（一段 10 秒 ≈ 20~60 MB，但会累计）。")
         return True
 
     # ---------------- 内存体检 ----------------
@@ -2776,6 +2862,58 @@ class ReplayDirector:
             #   只能反复播很早以前那一段素材。现在到点自动交还。
             self._expire_manual_lock()
 
+            # ★ 资源哨兵：每 ~2 秒看一眼可用内存，压力过大就警告、再大就主动
+            #   把我们占的滚动缓冲放掉（见 resource_pressure 的说明）。
+            self._watch_tick += 1
+            if self._watch_tick >= 40:
+                self._watch_tick = 0
+                self._watch_resources()
+
+    def _watch_resources(self):
+        """资源哨兵：内存快没了就先自救（把回放缓冲还回去），别等整机换页卡死。
+
+        为什么放在引擎里：用户现场是**正在直播时整机卡死、直播间也卡死**。
+        真到换页风暴那一步，谁都救不了；能救的是"提前把自己占的几 GB 退出来"。
+        """
+        cfg = self.cfg
+        if not cfg.get("resource_watch", True):
+            return
+        total, avail = system_memory_gb()
+        state = resource_pressure(avail, total,
+                                  cfg.get("low_mem_warn_pct", 12.0),
+                                  cfg.get("low_mem_release_pct", 6.0))
+        now = time.time()
+        if state == "ok":
+            if self._mem_alert and now - self._mem_alert_at > 60:
+                log(f"   🧠 内存压力已恢复：可用 {avail:.1f}/{total:.1f} GB")
+                self._mem_alert = ""
+            return
+        if now - self._mem_alert_at < 20:      # 20 秒内不重复刷
+            return
+        self._mem_alert_at = now
+        pct = avail / total * 100 if total else 0
+        if state == "warn":
+            if self._mem_alert != "warn":
+                self._mem_alert = "warn"
+                log(f"   ⚠️ 内存吃紧：可用 {avail:.1f}/{total:.1f} GB（{pct:.0f}%）——"
+                    f"继续下去可能整机换页卡死（直播也会跟着卡）。")
+                log("      建议：把「单段素材上限」调小、关掉回放功能，或看看谁在吃内存。")
+            return
+        # state == "release"：动手自救
+        self._mem_alert = "release"
+        log(f"   🚨 内存快没了：可用 {avail:.1f}/{total:.1f} GB（{pct:.0f}%）——"
+            f"**主动释放回放缓冲**，避免整机换页卡死（直播要紧）。")
+        try:
+            if self._capture_disabled is False:
+                self.release_capture("内存哨兵：可用内存过低")
+                log("      ✔ 已把插件的滚动缓冲放掉（那几 GB 还回去了）；"
+                    "硬要再用回放，请先降时长/清内存。")
+            else:
+                log("      （滚动缓冲本来就没在占；如果你开着常驻缓冲模式，"
+                    "建议改成「省内存」或关掉回放功能）")
+        except Exception as e:
+            log(f"      ⚠️ 释放失败：{e}")
+
     def _resume_after_wrap(self):
         """包装转场放完了 → 让回放真正开始播。
 
@@ -3207,17 +3345,33 @@ class KeyHook:
         VK_LEFT                → 匹配该键（不管扩展位）
         (VK_RETURN, True)      → 只匹配小键盘 Enter（扩展位=1）
       小键盘 Enter 和主键盘 Enter 的 vkCode 都是 0x0D，靠扩展位区分。
+
+    ★★ 2026-10-08 重要改造：**回调里只入队，绝不做别的事**。
+    低级键盘钩子有一个致命特性：**回调返回之前，全系统的键盘输入都排队等着**。
+    只要钩子所在进程被卡住（内存换页、杀软扫描、磁盘满、线程创建要内存…），
+    用户看到的就是"所有软件都没反应、像死机一样"。
+    原来的写法在回调里 `threading.Thread(...).start()` —— 建线程要申请内存，
+    在换页风暴里可能要几百毫秒甚至更久，正好会放大这种卡死。
+    现在：回调只做「查表 + 去抖 + `queue.put_nowait`」（都是纯内存操作，微秒级），
+    真正的动作由**一个常驻工作线程**从队列里取出来执行；队列满了就丢事件（绝不阻塞）。
+    另外回调里会记耗时，一旦超过 `slow_ms` 就记一次日志并提示改用轮询模式。
     """
 
-    def __init__(self, bindings, debounce=0.4):
+    def __init__(self, bindings, debounce=0.4, slow_ms=120.0):
         _setup_win_prototypes()
         self.bindings = bindings
         self.debounce = debounce
+        self.slow_ms = float(slow_ms)
         self._last = {}
         self._proc = _HOOKPROC(self._dispatch)
         self._hook = None
         self.ok = False
         self.error = ""
+        # 事件队列 + 单个消费者线程（容量给足；满了就丢，宁丢也不卡键盘）
+        self._events = queue.Queue(maxsize=256)
+        self._stop = threading.Event()
+        self._worker = None
+        self._slow_logged = 0
 
     def _lookup(self, vk, ext):
         for k in ((vk, ext), vk):
@@ -3226,6 +3380,9 @@ class KeyHook:
         return None
 
     def _dispatch(self, nCode, wParam, lParam):
+        # ⚠️ 这个函数里**禁止**任何可能阻塞的操作：不建线程、不开文件、不发网络、
+        #    不拿锁、不打印（打印会写控制台/文件）。只做查表 + 入队。
+        t0 = time.perf_counter()
         try:
             if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
@@ -3233,13 +3390,43 @@ class KeyHook:
                 cb = self._lookup(vk, ext)
                 if cb:
                     now = time.time()
-                    if now - self._last.get((vk, ext), 0.0) >= self.debounce:
-                        self._last[(vk, ext)] = now
-                        # 回调放独立线程跑，绝不阻塞钩子（会拖慢全系统输入）
-                        threading.Thread(target=cb, daemon=True).start()
+                    key = (vk, ext)
+                    if now - self._last.get(key, 0.0) >= self.debounce:
+                        self._last[key] = now
+                        if len(self._last) > 64:      # 防止字典无限长
+                            self._last.clear()
+                            self._last[key] = now
+                        try:
+                            self._events.put_nowait(cb)
+                        except queue.Full:
+                            pass                      # 队列满 = 宁可丢这一次，也不卡键盘
         except Exception:
             pass
+        finally:
+            # 只在异常慢的时候进入（正常是微秒级），不影响性能
+            try:
+                cost = (time.perf_counter() - t0) * 1000.0
+                if cost > self.slow_ms:
+                    self._slow_logged += 1
+                    if self._slow_logged <= 3:
+                        log(f"   ⚠️ 键盘钩子回调耗时 {cost:.0f} ms（超过 {self.slow_ms:.0f} ms）——"
+                            f"机器可能正被换页/杀软拖住；如果频繁出现，请把设置里的"
+                            f"「键盘监听方式」改成**轮询**（不经过输入管线，物理上不会拖住键盘）")
+            except Exception:
+                pass
         return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+    def _worker_loop(self):
+        """唯一执行动作的地方（不在钩子回调里跑）。"""
+        while not self._stop.is_set():
+            try:
+                cb = self._events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                cb()
+            except Exception:
+                pass
 
     def start(self):
         """
@@ -3251,6 +3438,9 @@ class KeyHook:
           2) WH_KEYBOARD_LL 的回调是投递到**安装钩子的那个线程**的，
              所以安装和消息循环必须在**同一个线程**里做。
         """
+        self._stop.clear()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
         self._ready = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
         self._ready.wait(4.0)
@@ -3281,6 +3471,7 @@ class KeyHook:
                 self._ready.set()
 
     def stop(self):
+        self._stop.set()
         if self._hook:
             try:
                 ctypes.windll.user32.UnhookWindowsHookEx(ctypes.c_void_p(self._hook))
@@ -3288,6 +3479,126 @@ class KeyHook:
                 pass
             self._hook = None
             self.ok = False
+
+
+class PollKeyWatcher:
+    """**不用全局钩子**的备选按键监听：`GetAsyncKeyState` 轮询。
+
+    为什么要有它（2026-10-08，用户报"使用时所有软件都不能正常运行"）：
+    低级键盘钩子必须"秒回"，**回调没返回之前全系统的键盘都在排队**。
+    如果引擎所在进程被卡住（内存换页、杀软扫描、磁盘满），用户就会觉得整机死了。
+    轮询方案**根本不进入输入管线**，物理上不可能拖住键盘；代价是两条：
+
+      1. 认不出**扩展位** —— 主键盘 Enter 和小键盘 Enter 在 vk 层面同码，
+         所以轮询模式下按主键盘 Enter 也会触发「播放」（默认键是小键盘 Enter）。
+         想把两者分开，就把「播放」改绑成 F8 之类；
+      2. 极快的点按（短于轮询间隔）理论上可能漏掉 —— 默认 20ms（50Hz）足够，
+         需要更灵敏可以调 `key_poll_ms`。
+
+    另外：**它不占用任何钩子**，所以更适合"钩子被安全软件拦/被系统丢弃"的机器。
+    """
+
+    def __init__(self, bindings, debounce=0.4, interval=0.02):
+        _setup_win_prototypes()
+        # 轮询只能按 vk 认键：把 (vk, ext) 形式的绑定拍平成 vk
+        self.bindings = {}
+        self.conflicts = []
+        for k, cb in bindings.items():
+            vk = k[0] if isinstance(k, tuple) else k
+            if vk in self.bindings:
+                self.conflicts.append(vk)
+                continue
+            self.bindings[vk] = cb
+        self.debounce = debounce
+        self.interval = max(0.005, float(interval))
+        self.ok = False
+        self.error = ""
+        self._stop = threading.Event()
+        self._thread = None
+        self._down = {}
+        self._last = {}
+
+    def _poll_loop(self):
+        u32 = ctypes.windll.user32
+        try:
+            u32.GetAsyncKeyState.restype = ctypes.c_short
+            u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        except Exception:
+            pass
+        while not self._stop.is_set():
+            try:
+                now = time.time()
+                for vk, cb in self.bindings.items():
+                    down = bool(u32.GetAsyncKeyState(int(vk)) & 0x8000)
+                    if down and not self._down.get(vk):
+                        if now - self._last.get(vk, 0.0) >= self.debounce:
+                            self._last[vk] = now
+                            try:
+                                cb()
+                            except Exception:
+                                pass
+                    self._down[vk] = down
+            except Exception:
+                pass
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self._down.clear()
+        self._last.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        self.ok = True
+        if self.conflicts:
+            log(f"   ⚠️ 轮询模式：有 {len(self.conflicts)} 个键被多个动作共用，已只保留第一个")
+        return True
+
+    def stop(self):
+        self._stop.set()
+        self.ok = False
+
+
+def build_key_bindings(controller, cfg):
+    """按配置生成 `{绑定键: 回调}`（钩子模式和轮询模式共用）。"""
+    keys, problems = normalize_keys(cfg if "keys" in cfg else {"keys": DEFAULTS["keys"]})
+    handlers = {"mark_in": controller.on_mark_in,
+                "mark_out": controller.on_mark_out,
+                "save": controller.on_save,
+                "play": controller.on_play}
+    bindings = {}
+    for action, toks in keys.items():
+        for tok in toks:
+            key = binding_of_token(tok)
+            if key is not None:
+                bindings[key] = handlers[action]
+    return bindings, problems
+
+
+def make_key_watcher(controller, cfg):
+    """按 `key_mode` 造监听器：`hook`（默认，精确）/ `poll`（不碰输入管线，最稳）。
+
+    2026-10-08：用户报"使用时所有软件都不能正常运行"，而低级键盘钩子一旦被卡住
+    就会拖住全系统输入。所以除了修掉钩子回调里的阻塞操作，还给出这个**完全绕开
+    输入管线**的轮询方案，让现场能一键排查到底是不是钩子的问题。
+    """
+    cfg = cfg or {}
+    bindings, problems = build_key_bindings(controller, cfg)
+    for p in problems:
+        log(f"   ⚠️ 键位配置：{p}")
+    debounce = float(cfg.get("key_debounce", 0.5) or 0.5)
+    mode = str(cfg.get("key_mode") or "hook").lower()
+    if mode == "poll":
+        ms = cfg.get("key_poll_ms", 20)
+        try:
+            interval = max(0.005, float(ms) / 1000.0)
+        except Exception:
+            interval = 0.02
+        log(f"⌨  按键监听方式：轮询（每 {interval * 1000:.0f} ms 查一次，"
+            f"不安装全局钩子 —— 绝不会拖住系统输入）")
+        log("      （轮询认不出主键盘/小键盘 Enter 的区别；要区分就把「播放」改成 F8 之类）")
+        return PollKeyWatcher(bindings, debounce=debounce, interval=interval)
+    log("⌨  按键监听方式：全局钩子（只读、回调里只入队，不阻塞输入）")
+    return KeyHook(bindings, debounce=debounce)
 
 
 class ManualController:
@@ -3443,24 +3754,14 @@ def make_manual_hook(controller, cfg=None, debounce=None):
 
     ★ 键位来自 `cfg["keys"]`（字符串键名），在图形界面或 `--set-keys` 里可以改；
       没有小键盘的键盘可以把 play 改成 f8 之类。认不出的键会打日志并退回默认值。
+
+    ★ 监听方式由 `cfg["key_mode"]` 决定（`hook` 默认 / `poll` 不用钩子）——
+      见 `make_key_watcher`；这个函数保留下来只是为了不破坏老调用。
     """
     cfg = cfg or {}
-    keys, problems = normalize_keys(cfg if "keys" in cfg else {"keys": DEFAULTS["keys"]})
-    for p in problems:
-        log(f"   ⚠️ 键位配置：{p}")
-    handlers = {"mark_in": controller.on_mark_in,
-                "mark_out": controller.on_mark_out,
-                "save": controller.on_save,
-                "play": controller.on_play}
-    bindings = {}
-    for action, toks in keys.items():
-        for tok in toks:
-            key = binding_of_token(tok)
-            if key is not None:
-                bindings[key] = handlers[action]
-    if debounce is None:
-        debounce = float(cfg.get("key_debounce", 0.5) or 0.5)
-    return KeyHook(bindings, debounce=debounce)
+    if debounce is not None:
+        cfg = dict(cfg, key_debounce=debounce)
+    return make_key_watcher(controller, cfg)
 
 
 # ============================================================================

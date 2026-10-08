@@ -89,6 +89,11 @@ CONSOLE_TRIGGER_LABELS = (
     ("round1", "每场第 1 个冻结时间发一次"),
     ("manual", "只手动（点下面的按钮 / HTTP）"),
 )
+# 键盘监听方式（排查"一开这软件整机就卡"时切到轮询做对照）
+KEY_MODE_LABELS = (
+    ("hook", "全局钩子（默认，精确：能分主/小键盘 Enter）"),
+    ("poll", "轮询（不经过输入管线，物理上不会拖住键盘）"),
+)
 
 # 第一次用（旁边还没有 config.json）时顶在按键区上方的那句提醒
 FIRST_RUN_HINT = (
@@ -272,6 +277,10 @@ class DirectorGui:
         self.var_console_close = tk.BooleanVar(value=bool(cfg.get("cs_console_close", True)))
         self.var_console_focus = tk.BooleanVar(
             value=bool(cfg.get("cs_console_require_focus", True)))
+        # 键盘监听方式（hook / poll）
+        km = str(cfg.get("key_mode", "hook")).lower()
+        self.var_key_mode = tk.StringVar(
+            value=dict(KEY_MODE_LABELS).get(km, KEY_MODE_LABELS[0][1]))
 
         # 秒数/模式一变就重算内存；端口一变就重算手机地址
         self.var_seconds.trace_add("write", lambda *_: self._update_estimate())
@@ -468,6 +477,22 @@ class DirectorGui:
                       foreground="#b35900", wraplength=820, justify="left").grid(
                 row=row0, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 0))
             row0 += 1
+
+        # ★ 2026-10-08：按键监听方式。用户报"开这软件后所有程序都像死机"，
+        #   而低级键盘钩子一旦被卡住就会拖住全系统输入 —— 这里给一个一键切换的
+        #   "不碰输入管线"方案，方便现场做对照实验。
+        ttk.Label(f, text="键盘监听方式", width=14).grid(
+            row=row0, column=0, sticky="w", padx=8, pady=(6, 2))
+        ttk.Combobox(f, textvariable=self.var_key_mode, state="readonly", width=30,
+                     values=[v for _, v in KEY_MODE_LABELS]).grid(
+            row=row0, column=1, columnspan=3, sticky="w", pady=(6, 2))
+        ttk.Label(f, text="钩子＝精确（能分主/小键盘 Enter）；轮询＝不经过输入管线，"
+                          "物理上不会拖住键盘（排查死机时先切这个做对照）",
+                  font=SMALL_FONT, foreground="#666666", wraplength=820,
+                  justify="left").grid(row=row0 + 1, column=0, columnspan=4, sticky="w",
+                                       padx=8, pady=(0, 4))
+        row0 += 2
+
         ttk.Label(f, text=KEY_HINT, font=SMALL_FONT, foreground="#666666",
                   wraplength=800, justify="left").grid(
             row=row0, column=0, columnspan=4, sticky="w",
@@ -966,6 +991,9 @@ class DirectorGui:
             self.var_console_gap, 120, "控制台两条指令之间（毫秒）"))
         cfg["cs_console_close"] = bool(self.var_console_close.get())
         cfg["cs_console_require_focus"] = bool(self.var_console_focus.get())
+        # 键盘监听方式
+        km2val = {text: val for val, text in KEY_MODE_LABELS}
+        cfg["key_mode"] = km2val.get(self.var_key_mode.get(), "hook")
         return cfg
 
     def write_config(self, notify=True):
