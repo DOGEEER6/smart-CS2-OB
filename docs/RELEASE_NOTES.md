@@ -3,6 +3,13 @@
 > 用法：在 GitHub 上打 tag / 发 Release 时，把对应小节整段拷进 Release 说明里即可。
 > 最新的放最上面。tag 名沿用仓库既有约定：`smart-CS2-OB-v版本.日期`
 > （历史：`smart-CS2-OB-v1.0`、`smart-CS2-OB-v1.0.261006`）。
+>
+> **附件**：`python build_exe.py` 现在会在出包的同时自动打一个 **`CS2导播助手.zip`**（约 12 MB），
+> 直接把它作为 Release 附件上传即可（文件夹版本身不适合进 git，已被 `.gitignore` 排除）。
+>
+> **正文里想插界面截图**：用仓库里的绝对地址，例如
+> `https://raw.githubusercontent.com/DOGEEER6/smart-CS2-OB/main/docs/gui-1-replay.png`
+> （`gui-1-replay` / `gui-2-companion` / `gui-3-console` / `gui-4-scenes`）。
 
 ---
 

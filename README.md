@@ -98,6 +98,9 @@
 
 ### 方式一：用打好的成品（推荐，不需要装 Python）
 
+> 拿到的是 **`CS2导播助手.zip`**（约 12 MB）就先解压，然后双击里面的 `开始导播.exe`；
+> 拿到的是整个 `CS2导播助手\` 文件夹就直接双击（别只拷 exe，`_internal\` 必须一起）。
+
 ```bat
 :: 1. 打开 OBS（不用开播）
 :: 2. 第一次用：双击
@@ -184,6 +187,16 @@ python build_exe.py --clean
 | **③ CS 控制台指令** | 开播前自动输入的多条控制台指令（白底输入框 + 灰色示例）+ 触发时机 + 「现在发送一次」 |
 | **④ 场景** | 直播场景 / 回放场景 / 回放源名称 |
 | **引擎与日志**（常驻在下方） | 保存配置、启动/停止引擎、首次设置向导、内存体检、日志输出 |
+
+<p align="center">
+  <img src="docs/gui-1-replay.png" width="48%" alt="① 回放与按键：开关回放功能、选内存模式、改按键" />
+  <img src="docs/gui-2-companion.png" width="48%" alt="② 副驾 / 存盘：自动切换、灵敏度、显示名字、存盘后处理" />
+</p>
+<p align="center">
+  <img src="docs/gui-3-console.png" width="48%" alt="③ CS 控制台指令：开播前自动输入的多条指令" />
+  <img src="docs/gui-4-scenes.png" width="48%" alt="④ 场景：直播场景 / 回放场景 / 回放源名称" />
+</p>
+<p align="center"><i>四个页签的实际界面（点标签按钮切换；「③ CS 控制台指令」在你还没填指令时会亮成橙色）。</i></p>
 
 | 窗口里能做的事 | 说明 |
 |---|---|
@@ -338,6 +351,9 @@ f1..f24 / a..z / 0..9 / backslash / comma / period / slash / semicolon / quote /
 
 打比赛前你总要往 CS2 控制台敲那几句（`sv_cheats`、`mp_freezetime`、`cl_draw_only_deathnotices`…）。
 现在把这些指令填进设置窗口，引擎开播时替你敲：**打开控制台 → 逐条输入并回车 → 关掉控制台**，一条不落。
+
+<p align="center"><img src="docs/gui-3-console.png" width="72%" alt="CS 控制台指令设置页" /></p>
+<p align="center"><i>在「③ CS 控制台指令」页里一行一条填进去就行。</i></p>
 
 - 位置：设置窗口里的 **「CS 控制台指令（每次开播前自动输入，一行一条，可多条）」** 文本框。
   它在设置窗口的 **「CS 控制台指令」标签页**里（窗口分了 4 页：回放与按键 / 副驾 存盘 /

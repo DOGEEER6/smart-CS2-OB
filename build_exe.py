@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """把导播工具打包成双击就能用的成品。
 
-    python build_exe.py                 # 默认：文件夹版（推荐，最稳）
+    python build_exe.py                 # 默认：文件夹版（推荐，最稳）+ 自动打 zip
+    python build_exe.py --no-zip        # 不打 zip
     python build_exe.py --mode onefile  # 单文件版（拷来拷去方便）
     python build_exe.py --clean         # 先清干净再打包
 
 产物：
   文件夹版   CS2导播助手\\开始导播.exe      （旁边还有 _internal\\ 和 先运行我-首次设置.cmd）
+             CS2导播助手.zip                （同目录下，方便发给别人 / 传 Release 附件）
   单文件版   开始导播.exe                   （就一个文件）
 
 双击「开始导播.exe」= 图形设置窗口（2026-10-07 起）；窗口里点「启动引擎」才开始导播。
@@ -26,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
@@ -141,6 +144,38 @@ def verify_built_exe(exe_path):
     return True
 
 
+def make_zip(folder, zip_path):
+    """把成品文件夹打成 zip（发给别人 / 传 GitHub Release 附件用）。
+
+    为什么要有这一步：以前只出文件夹，用户会问"压缩包在哪？" ——
+    README 里又提到过"压缩包 7.6 MB"，那是手压的，脚本从来不打。
+    现在默认就顺手打一个，`--no-zip` 可以关掉。
+    """
+    if os.path.exists(zip_path):
+        try:
+            os.remove(zip_path)
+        except OSError as e:
+            print(f"  ⚠️ 删不掉旧的 {zip_path}（{e}）—— 跳过打 zip")
+            return None
+    total = 0
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            base_parent = os.path.dirname(os.path.abspath(folder))
+            for dp, _dn, fns in os.walk(folder):
+                for fn in fns:
+                    full = os.path.join(dp, fn)
+                    rel = os.path.relpath(full, base_parent)   # 压缩包里保留顶层文件夹名
+                    z.write(full, rel)
+                    total += 1
+    except Exception as e:
+        print(f"  ⚠️ 打 zip 失败：{e}")
+        return None
+    size = os.path.getsize(zip_path) / 1024 / 1024
+    print(f"  ✅ 已打包 {total} 个文件 → {zip_path}（{size:.1f} MB）")
+    print("     这个 zip 可以直接发给别人；发 GitHub Release 就把它传成附件。")
+    return zip_path
+
+
 def copy_extras(dest_dir):
     """把说明书和一键放行脚本拷进成品目录，让整个文件夹自包含。"""
     for name in EXTRAS:
@@ -240,6 +275,7 @@ def build_onefile():
 def main():
     argv = sys.argv[1:]
     mode = "onedir"
+    want_zip = "--no-zip" not in argv
     if "--mode" in argv:
         mode = argv[argv.index("--mode") + 1]
     if "--onefile" in argv:
@@ -285,6 +321,13 @@ def main():
         print()
         print("⚠️  产物自检没过 —— 请把上面的输出发出来，先别把它拷给别人。")
         return 3
+
+    zip_path = None
+    if want_zip and mode == "onedir":
+        print()
+        print("打 zip（发给别人 / 传 Release 附件用）：")
+        zip_path = make_zip(out, os.path.join(HERE, FOLDER_NAME + ".zip"))
+
     print()
     print("=" * 66)
     print(f"✅ 打包完成，用了 {time.time() - t0:.0f} 秒")
@@ -293,12 +336,15 @@ def main():
         print(f"  成品文件夹: {out}")
         print(f"  整个文件夹: {size:.1f} MB")
         print(f"  双击这个  : {exe}")
+        if zip_path:
+            print(f"  发给别人用: {zip_path}"
+                  f"（{os.path.getsize(zip_path) / 1024 / 1024:.1f} MB，解压后双击 开始导播.exe）")
         print()
         print("  第一次用：先双击文件夹里的「先运行我-首次设置.cmd」")
         print("  之后每次：双击「开始导播.exe」打开设置窗口，点「启动引擎」开始导播")
         print("            （不想开窗口就跑命令行：开始导播.exe --engine）")
         print()
-        print("  注意：整个文件夹一起拷走才能用（别只拷 exe）。")
+        print("  注意：整个文件夹一起拷走才能用（别只拷 exe）。不想打 zip 加 --no-zip。")
     else:
         print(f"  成品: {out}   {size:.1f} MB")
         print()
