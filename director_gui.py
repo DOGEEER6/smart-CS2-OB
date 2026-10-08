@@ -292,6 +292,10 @@ class DirectorGui:
             value=dict(BACKEND_LABELS).get(bk, BACKEND_LABELS[0][1]))
         self.var_media_item = tk.StringVar(
             value=str(cfg.get("replay_media_item", "回放媒体源")))
+        # ★ 2026-10-08 真机发现：OBS 每存一次缓冲就新写一个文件（1080p60 约 25 MB），
+        #   裁完不清理的话录像目录会越攒越满 —— 默认裁完就删掉那份原始文件。
+        self.var_del_buf = tk.BooleanVar(
+            value=bool(cfg.get("obs_delete_buffer_after_trim", True)))
         self.var_backend.trace_add("write", lambda *_: self._update_estimate())
 
         # 秒数/模式一变就重算内存；端口一变就重算手机地址
@@ -457,6 +461,12 @@ class DirectorGui:
         ttk.Label(f, text="（回放场景里那个媒体源；缺了引擎会自动建）",
                   font=SMALL_FONT, foreground="#666666").grid(
             row=row, column=2, columnspan=2, sticky="w", padx=(4, 8), pady=2)
+        row += 1
+        tk.Checkbutton(f, text="obs 后端：裁完自动删掉 OBS 那份原始缓冲文件（省磁盘，"
+                               "一场比赛能省几个 GB）",
+                       variable=self.var_del_buf, wraplength=760, justify="left",
+                       anchor="w", highlightthickness=0).grid(
+            row=row, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 0))
         row += 1
         ttk.Label(f, text="插件后端＝内存放未压缩帧（1080p60 十秒两份 ≈ 9.95 GB，能瞬间定格/任意入点）；"
                           "obs 后端＝OBS 自带 Replay Buffer（编码后 ≈ 几十~几百 MB，"
@@ -1052,6 +1062,7 @@ class DirectorGui:
         bk2val = {text: val for val, text in BACKEND_LABELS}
         cfg["replay_backend"] = bk2val.get(self.var_backend.get(), "plugin")
         cfg["replay_media_item"] = self.var_media_item.get().strip() or "回放媒体源"
+        cfg["obs_delete_buffer_after_trim"] = bool(self.var_del_buf.get())
         return cfg
 
     def write_config(self, notify=True):

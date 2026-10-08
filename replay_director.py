@@ -321,6 +321,9 @@ DEFAULTS = {
     "trim_reencode_crf": 18,
     # 按 SaveReplayBuffer 之后最多等多久（毫秒）让 OBS 把文件落盘
     "obs_buffer_wait_ms": 8000,
+    # 裁完片段后要不要删掉 OBS 那份原始缓冲文件（OBS 每存一次就新写一个文件，
+    # 不删的话磁盘会越攒越满：真机实测一次约 30 MB）。false = 留着原始文件。
+    "obs_delete_buffer_after_trim": True,
 
     # --- 和 Astra 的协作（重要）---    # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
     #   require_live_scene : 只有当直播场景正好是 live_scene 时才插回放。
@@ -537,6 +540,84 @@ def canvas_from_obs_config():
     return None
 
 
+def obs_active_profile_ini():
+    """读**当前正在用的** OBS 配置的 `basic.ini` 全文（读不到返回 ""）。
+
+    为什么不用 `canvas_from_obs_config()` 那种"扫第一个"的笨办法：那个函数只是
+    为了在**启动前**猜个画布，多点少点无所谓；而回放缓冲时长（`RecRBTime`）决定
+    "能标多长的片段"，必须认准 OBS 里真正激活的那个配置 —— 名字就写在
+    `%APPDATA%\\obs-studio\\user.ini` 的 `[Basic] ProfileDir`（老版本 `Profile`）里。
+    """
+    try:
+        base = os.path.join(os.environ.get("APPDATA", ""), "obs-studio")
+        name = ""
+        user_ini = os.path.join(base, "user.ini")
+        if os.path.isfile(user_ini):
+            with open(user_ini, encoding="utf-8-sig", errors="replace") as f:
+                txt = f.read()
+            m = re.search(r"^ProfileDir=(.+)$", txt, re.M) or \
+                re.search(r"^Profile=(.+)$", txt, re.M)
+            if m:
+                name = m.group(1).strip()
+        if name:
+            ini = os.path.join(base, "basic", "profiles", name, "basic.ini")
+            if os.path.isfile(ini):
+                with open(ini, encoding="utf-8-sig", errors="replace") as f:
+                    return f.read()
+        # 退回"扫第一个有 [SimpleOutput]/[AdvOut] 的配置"
+        prof_dir = os.path.join(base, "basic", "profiles")
+        for n in sorted(os.listdir(prof_dir)) if os.path.isdir(prof_dir) else []:
+            ini = os.path.join(prof_dir, n, "basic.ini")
+            if os.path.isfile(ini):
+                with open(ini, encoding="utf-8-sig", errors="replace") as f:
+                    txt = f.read()
+                if "RecRBTime=" in txt:
+                    return txt
+    except Exception:
+        pass
+    return ""
+
+
+def obs_replay_buffer_info():
+    """读 OBS 自己的"回放缓冲"设置：`{"enabled": bool, "seconds": float|None}`。
+
+    ★ 真机教训（2026-10-08，OBS 32.x）：obs-websocket 的
+      `GetOutputSettings("ReplayBuffer")` 在真机上**返回 `{}`**（什么设置都读不到），
+      光靠它没法告诉用户"你最多能标多长"。而同一份设置就明明白白写在
+      `basic.ini` 里：简单输出模式在 `[SimpleOutput]`、高级输出模式在 `[AdvOut]`，
+      键名都是 `RecRB`（开关）和 `RecRBTime`（秒）。哪个段生效由 `[Output] Mode=` 决定。
+    """
+    txt = obs_active_profile_ini()
+    if not txt:
+        return {"enabled": None, "seconds": None}
+    # 按段切出来（ini 里同名键在两个段都可能有，必须认段）
+    sections, cur = {}, ""
+    for line in txt.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            cur = s[1:-1]
+            sections.setdefault(cur, {})
+        elif "=" in s and cur:
+            k, v = s.split("=", 1)
+            sections[cur][k.strip()] = v.strip()
+    mode = (sections.get("Output", {}).get("Mode") or "Simple").lower()
+    sec = sections.get("AdvOut" if mode.startswith("adv") else "SimpleOutput", {})
+    enabled = None
+    if "RecRB" in sec:
+        enabled = sec["RecRB"].lower() in ("true", "1", "yes")
+    seconds = None
+    try:
+        if "RecRBTime" in sec:
+            seconds = float(sec["RecRBTime"])
+    except Exception:
+        seconds = None
+    if seconds is None:                      # 段里没有就全局找一个兜底
+        m = re.search(r"^RecRBTime=([\d.]+)", txt, re.M)
+        if m:
+            seconds = float(m.group(1))
+    return {"enabled": enabled, "seconds": seconds}
+
+
 def disk_free_gb(path):
     """某个路径所在盘还剩多少 GB（读不到返回 None）。"""
     try:
@@ -711,9 +792,14 @@ class GsiHandler(http.server.BaseHTTPRequestHandler):
             # ★ 2026-10-07：手动发一次 CS 控制台指令（设置窗口的「现在发送一次」也走这里）
             body = json.dumps({"ok": app.send_console("HTTP 手动")}).encode("utf-8")
             code = 200
+        elif path == "/control/save":
+            # ★ 2026-10-08：留档当前片段（等于按「保留片段」键）—— 手机上/浏览器里
+            #   也能留档，不用非得按键盘。
+            body = json.dumps({"ok": app.save_clip()}).encode("utf-8")
+            code = 200
         else:
             body = (b'{"error":"use /control/status | /lock | /unlock | /replay'
-                    b' | /mark_in | /mark_out"}')
+                    b' | /mark_in | /mark_out | /console | /save"}')
             code = 404
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1471,6 +1557,7 @@ class ObsBufferBackend:
         self.ready = False
         self.clip_path = ""          # 当前这段裁好的文件
         self.clip_seconds = 0.0
+        self._prev_clip = ""         # 上一次裁的那份工作副本（下次裁完就删，免得堆磁盘）
 
     # ---------------- 内存账（编码后，MB 级）----------------
     def memory_mb(self):
@@ -1540,8 +1627,19 @@ class ObsBufferBackend:
                     break
                 except Exception:
                     pass
+        # ★ 真机教训（2026-10-08）：OBS 32.x 上 `GetOutputSettings("ReplayBuffer")`
+        #   返回 `{}`，读不到时长 —— 退回读 OBS 配置文件（一样准，还不用等 OBS）。
+        info = obs_replay_buffer_info()
+        if not buf_sec and info.get("seconds"):
+            buf_sec = info["seconds"]
+            logv(cfg, f"   （回放缓冲时长来自 OBS 配置文件：{buf_sec:.0f} 秒）")
         cfg["obs_buffer_seconds"] = buf_sec
         want = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+        if info.get("enabled") is False:
+            log("   ⚠️ OBS 里「回放缓冲」是**关着**的（basic.ini: RecRB=false）——"
+                "按入点键时 StartReplayBuffer 会被 OBS 拒绝。")
+            log("      去 OBS → 设置 → 输出 → 输出模式「简单」→ 勾「启用回放缓冲」，"
+                "然后**重启一次 OBS**（回放缓冲的输出是启动时创建的）。")
         if buf_sec:
             log(f"   OBS 回放缓冲时长：{buf_sec:.0f} 秒"
                 f"{'' if buf_sec >= want else f'  ⚠️ 小于单段上限 {want:.0f} 秒 → 片段会被截短，'
@@ -1561,6 +1659,8 @@ class ObsBufferBackend:
         if not self.ready:
             return False
         if self.obs.replay_buffer_active():
+            logv(self.cfg, f"   （回放缓冲已经在跑了 —— 可能是 OBS 用 --startreplaybuffer 起的，"
+                           f"直接用它：{reason or 'obs 后端'}）")
             return False
         try:
             self.obs.start_replay_buffer()
@@ -1573,6 +1673,12 @@ class ObsBufferBackend:
                 "时长调成 ≥ "
                 f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒，编码器选 NVENC，"
                 "码率给足（比如 40 Mbps）。")
+            # ★ 真机教训（2026-10-08）：`RecRB=true` 写在配置里还不够 —— 回放缓冲这个
+            #   输出是 **OBS 启动时**按设置创建的，所以在设置里勾完之后**必须重启一次
+            #   OBS**，否则 StartReplayBuffer 一直回 "Replay buffer is not available"。
+            log("      ⚠️ 刚在设置里勾的回放缓冲，**要重启一次 OBS 才生效**"
+                "（这个输出是启动时创建的）—— 报错里带 Replay buffer is not available "
+                "基本都是这个原因。")
             return False
 
     def release(self, reason=""):
@@ -1645,10 +1751,49 @@ class ObsBufferBackend:
             log("   ⚠️ 裁切失败，退回用整段缓冲文件")
             self.clip_path, self.clip_seconds = path, fsec
             return (path, fsec)
-        self.clip_path, self.clip_seconds = out, length
-        log(f"   ✔ 片段已裁好（{length:.1f} 秒，从 {start:.1f} 秒处开始；"
+        # ★ 真机教训（2026-10-08，实测于 OBS 32.x + NVENC 2 秒 GOP）：
+        #   `-c copy` **不能按帧裁** —— ffmpeg 会把起点往前对齐到最近的关键帧，
+        #   而 `-t` 是照**入点时间轴**数的，于是裁出来的文件比要的**长**：
+        #   实测 `-ss 2 -t 8` 得到 10.03 秒（多出的 2 秒就是往回对齐的那一个 GOP）。
+        #   内容上没坏（多出来的是入点**之前**的画面，结尾仍精确停在出点），
+        #   但如果还按"要了 8 秒"去算播放时长，回放就会**提前 2 秒切走、把结尾砍掉**。
+        #   所以这里一律以**文件实际时长**为准。
+        real = 0.0
+        try:
+            real = self._probe_seconds(out)
+        except Exception:
+            real = 0.0
+        if not real:
+            real = length
+        self.clip_path, self.clip_seconds = out, real
+        extra = real - length
+        log(f"   ✔ 片段已裁好（实际 {real:.1f} 秒，从 {start:.1f} 秒处开始；"
             f"{'零损失 copy' if self._trim_mode() == 'copy' else '精确重编码'}）")
-        return (out, length)
+        if extra > 0.15:
+            log(f"      （比要的 {length:.1f} 秒多了 {extra:.1f} 秒：copy 模式会对齐到关键帧，"
+                f"多出来的是入点**之前**的画面，结尾仍然停在出点）")
+        # ★ 真机教训（2026-10-08）：OBS 每按一次 SaveReplayBuffer 就**新写一个文件**
+        #   （我们裁完的那个 `_clip.mp4` 是它的副本），留着它们磁盘会越攒越满
+        #   （真机实测一次 30 MB；一场比赛按 50 次就是 1.5 GB）。裁切成功了就把它删掉。
+        if cfg.get("obs_delete_buffer_after_trim", True) and path != out:
+            try:
+                os.remove(path)
+                log(f"   🧹 已删掉 OBS 那份原始缓冲文件（省 {os.path.getsize(out) / 1e6:.1f} MB 磁盘；"
+                    f"想留着就把 config.json 的 obs_delete_buffer_after_trim 改成 false）")
+            except Exception as e:
+                logv(cfg, f"   （删原始缓冲文件失败，忽略: {e}）")
+        # 上一次裁的片段也删掉：它只是一份"待播/待留档"的工作副本，
+        # 不删的话 OBS 的录像目录里会一个片段一个文件地堆下去（同样吃磁盘）。
+        # 想留档的请在播放前后按一下「保留片段」键（那是 copy 到 save_dir，不受影响）。
+        old = self._prev_clip
+        if old and old != out and os.path.exists(old):
+            try:
+                os.remove(old)
+                logv(cfg, f"   🧹 已删掉上一次的工作片段（{os.path.basename(old)}）")
+            except Exception:
+                pass
+        self._prev_clip = out
+        return (out, real)
 
     def _trim_mode(self):
         m = str(self.cfg.get("trim_mode") or "copy").lower()
@@ -1821,6 +1966,7 @@ class ReplayDirector:
         self._capture_disabled = None    # None=还不知道；True=插件当前是 Disable 状态
         self._memory_info = {}           # 最近一次内存体检的原始数据
         self._watch_tick = 0             # 资源哨兵的计数器（ticker 每 50ms +1）
+        self._media_poll_at = 0.0        # obs 后端：上次问"媒体播完了吗"的时刻
         self._mem_alert = ""             # 上次的内存警告级别（ok/warn/release）
         self._mem_alert_at = 0.0
         self._config_path = CONFIG_PATH
@@ -2901,7 +3047,9 @@ class ReplayDirector:
             return size
         if mbps:
             # 手机 4K60 大概 50 Mbps 上下，4K30 约 25 Mbps —— 给一个能直接对比的参照
-            log(f"   📊 码率约 {mbps:.1f} Mbps（H.264 CRF23 veryfast，插件写死的参数）")
+            who = ("OBS 自己的录像编码器（你设的码率/画质）"
+                   if self.backend_name == "obs" else "H.264 CRF23 veryfast，插件写死的参数")
+            log(f"   📊 码率约 {mbps:.1f} Mbps（{who}）")
             if mbps > 80:
                 log("      比手机 4K60（≈50 Mbps）还高：CRF 是「保质量不保码率」，"
                     "画布越大、画面越乱就越大。")
@@ -3232,13 +3380,26 @@ class ReplayDirector:
         """
         cfg = self.cfg
         dur = max(1.0, float(cfg.get("record_max_seconds", 10.0)))
+        if self.backend_name == "obs":
+            # ★ 真机教训（2026-10-08）：obs 后端的缓冲是 **OBS 自己的回放缓冲**
+            #   （时长 = 设置里的「回放缓冲时长」），跟 `record_max_seconds`
+            #   （插件的单段上限）没关系。原来这里照抄插件的上限打比方，真机上就出现了
+            #   "攒了 12 秒、超过上限 10 秒、从 2.0 秒处开始播"这种**假警告** ——
+            #   实际文件 11.9 秒一点没丢，用户只会被吓一跳。
+            dur = float(cfg.get("obs_buffer_seconds")
+                        or obs_replay_buffer_info().get("seconds")
+                        or 20.0)
         now = time.time()
         elapsed = max(0.0, now - float(mark_at or 0.0))
         if self.replay_mode == "armed":
             if elapsed > dur + 0.2:
                 over = elapsed - dur
-                log(f"   ✂️ 这一段攒了 {elapsed:.1f} 秒、超过缓冲上限 {dur:.0f} 秒 → "
-                    f"开头 {over:.1f} 秒已经被滚动覆盖，从 {over:.1f} 秒处开始播")
+                if self.backend_name == "obs":
+                    log(f"   ✂️ 这一段攒了 {elapsed:.1f} 秒、超过 OBS 回放缓冲的 {dur:.0f} 秒 → "
+                        f"开头约 {over:.1f} 秒可能已经被滚动覆盖（以文件里实际的帧为准）")
+                else:
+                    log(f"   ✂️ 这一段攒了 {elapsed:.1f} 秒、超过缓冲上限 {dur:.0f} 秒 → "
+                        f"开头 {over:.1f} 秒已经被滚动覆盖，从 {over:.1f} 秒处开始播")
                 return over
             return 0.0
         since_last = now - self._last_snapshot_at if self._last_snapshot_at else dur
@@ -3521,6 +3682,10 @@ class ReplayDirector:
             elif self.replay_active and time.time() >= self.replay_hard_deadline:
                 self.counters["interrupted"] += 1
                 self._end_replay("超过硬上限")
+            elif (self.replay_active and self.backend_name == "obs"
+                  and not self._wrap_resume_at):
+                # 素材播完立刻切回（不然观众要盯着最后一帧等 5 秒兜底）
+                self._end_when_media_ends()
 
             # ★ 人工接管的锁必须有自动过期。
             #   实测踩过的大坑：回放期间 Astra 按比赛阶段把场景切到「数据看板」，
@@ -3580,6 +3745,26 @@ class ReplayDirector:
                     "建议改成「省内存」或关掉回放功能）")
         except Exception as e:
             log(f"      ⚠️ 释放失败：{e}")
+
+    def _end_when_media_ends(self):
+        """obs 后端专用：媒体源一播完就**立刻**切回直播。
+
+        为什么不能只靠 `replay_until` 兜底：那个时间是"素材时长 ÷ 速度 + 5 秒安全垫"，
+        真机实测（2026-10-08，5.93 秒素材 @70%）媒体第 8.5 秒就播完了，兜底要到第 14 秒
+        才切回 —— 中间 5 秒观众盯着的是**卡住的最后一帧**（媒体源
+        `clear_on_media_end=false` 会一直显示最后一帧）。插件后端是插件自己按帧切回，
+        没有这个问题；obs 后端得由我们来盯。
+        """
+        now = time.time()
+        if now - self._media_poll_at < 0.5:      # 最多每 0.5 秒问一次 OBS，别刷请求
+            return
+        self._media_poll_at = now
+        if now - self._started_at < 1.0:         # 刚开播，状态可能还是上一次的
+            return
+        st = self._media_state()
+        if st and str(st).endswith("ENDED"):
+            log("   ⏹ 素材已经播完 → 立刻切回直播（不等兜底计时）")
+            self._end_replay("素材播完")
 
     def _resume_after_wrap(self):
         """包装转场放完了 → 让回放真正开始播。
@@ -6383,6 +6568,14 @@ class App:
         self.controller.on_mark_out()
         return True
 
+    def save_clip(self):
+        """留档当前这段素材（等于按快捷键「保留片段」/ 小键盘 6）——`/control/save`。"""
+        if not self.controller:
+            log("（没有键盘控制器，忽略 save）")
+            return False
+        self.controller.on_save()
+        return True
+
     def send_console(self, reason="手动"):
         """手动发一次 CS 控制台指令（设置窗口按钮 / /control/console）。"""
         return self.console.send_now(reason)
@@ -6433,7 +6626,7 @@ class App:
         t.start()
         log(f"GSI 监听: http://{self.cfg['gsi_host']}:{self.cfg['gsi_port']}{self.cfg['gsi_path']}")
         log(f"控制端点: /control/status | /lock | /unlock | /replay"
-            f" | /mark_in | /mark_out")
+            f" | /mark_in | /mark_out | /console | /save")
 
 
 # ---------------------------------------------------------------------------
@@ -7253,7 +7446,7 @@ def run_live(cfg, manual_only=False):
     log("")
     log("就绪。把 gamestate_integration_director.cfg 放进 CS2 的 game/csgo/cfg/ 目录，")
     log("然后启动 CS2 观战即可。控制端点: /control/status | /lock | /unlock | /replay"
-        " | /mark_in | /mark_out | /console")
+        " | /mark_in | /mark_out | /console | /save")
     log("按 Ctrl+C 退出。")
     try:
         while True:
