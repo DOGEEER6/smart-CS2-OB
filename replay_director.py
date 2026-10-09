@@ -5303,6 +5303,63 @@ for _i in range(10):
 NAMED_SCANCODE["numpad0"] = (0x52, False)
 
 
+def show_char(ch):
+    """把一个字符变成"看得见"的写法（不可见/非 ASCII 的用 U+XXXX）。
+
+    为什么需要：用户从网页/Word 里复制控制台指令时，很容易带上**不换行空格 U+00A0**、
+    零宽空格、全角引号这类"看得见才怪"的字符。旧日志里它们被原样打印，
+    于是出现 `⚠️ 有字符没打出来：` 后面**什么都看不见**的诡异提示（2026-10-09 用户反馈）。
+    """
+    o = ord(ch)
+    if 32 <= o < 127:
+        return ch
+    if ch == "\t":
+        return "\\t"
+    return "U+%04X" % o
+
+
+# 常见"看着像 ASCII、其实不是"的字符 → 该换成什么（控制台只认 ASCII）
+_CONSOLE_CHAR_FIX = {
+    "\u00a0": " ",   # 不换行空格（网页复制最常见）
+    "\u2007": " ",   # figure space
+    "\u2009": " ",   # thin space
+    "\u202f": " ",   # narrow no-break space
+    "\u3000": " ",   # 全角空格
+    "\u200b": "",    # 零宽空格
+    "\ufeff": "",    # BOM / 零宽不换行空格
+    "\u201c": '"', "\u201d": '"',   # 中文引号 “ ”
+    "\u2018": "'", "\u2019": "'",   # 中文单引号 ‘ ’
+    "\uff02": '"', "\uff07": "'",   # 全角引号
+    "\uff0d": "-", "\u2013": "-", "\u2014": "-",   # 各种破折号
+    "\uff1b": ";", "\uff1d": "=", "\uff0e": ".", "\uff0c": ",", "\uff1a": ":",
+}
+
+
+def sanitize_console_text(s):
+    """把控制台指令里的"全角/不可见"字符换成 ASCII 等价物。
+
+    返回 `(干净文本, [改了什么…])`。`改了什么` 是给人看的说明（例如 `U+00A0→空格`）。
+    这条是为用户省事的：从网页复制来的指令经常带这些字符，旧版只会报一句
+    "有字符没打出来"却看不见是哪个，现在**自动修好并说明**。
+    """
+    out, fixed = [], []
+    for ch in s:
+        o = ord(ch)
+        if ch in _CONSOLE_CHAR_FIX:
+            new = _CONSOLE_CHAR_FIX[ch]
+            out.append(new)
+            fixed.append("%s→%s" % (show_char(ch),
+                                    "空格" if new == " " else ("删掉" if not new else new)))
+            continue
+        if 0xFF01 <= o <= 0xFF5E:          # 全角 ！-～ → 对应 ASCII
+            new = chr(o - 0xFEE0)
+            out.append(new)
+            fixed.append("%s→%s" % (show_char(ch), new))
+            continue
+        out.append(ch)
+    return "".join(out), fixed
+
+
 def send_key_scancode(sc, shift=False, tap_ms=14, extended=False):
     """按一次扫描码（可选按住 Shift / 扩展位）。返回 True/False。"""
     flags = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if extended else 0)
@@ -5319,7 +5376,7 @@ def send_key_scancode(sc, shift=False, tap_ms=14, extended=False):
                       u=_INPUTunion(ki=_KEYBDINPUT(0, SC_LSHIFT,
                                                    KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0, None)))
     try:
-        u32 = ctypes.windll.user32
+        u32 = ctypes.WinDLL("user32", use_last_error=True) if _HAS_WIN_ERR else ctypes.windll.user32
         u32.SendInput.restype = wintypes.UINT
         u32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
         sent = 0
@@ -5331,9 +5388,21 @@ def send_key_scancode(sc, shift=False, tap_ms=14, extended=False):
         sent += u32.SendInput(1, ctypes.byref(up), n)
         if shift:
             sent += u32.SendInput(1, ctypes.byref(shift_up), n)
+        if sent <= 0 and _HAS_WIN_ERR:
+            # 记下 Windows 的错误码：5=拒绝访问（UIPI/安全软件）87=参数错误（结构体问题）
+            global LAST_SENDINPUT_ERR
+            LAST_SENDINPUT_ERR = ctypes.get_last_error()
         return sent > 0
     except Exception:
         return False
+
+
+LAST_SENDINPUT_ERR = 0        # 最近一次 SendInput 失败时的 GetLastError
+try:
+    ctypes.WinDLL("user32", use_last_error=True)
+    _HAS_WIN_ERR = True
+except Exception:
+    _HAS_WIN_ERR = False
 
 
 def type_text(text, per_char_ms=14):
@@ -5433,6 +5502,9 @@ class ConsoleTyper:
         其次是安全软件拦了输入注入。
         """
         log("      ⚠️ 按键被系统挡住了（SendInput 返回 0）—— 控制台指令和「自动切换」都会失效。")
+        if LAST_SENDINPUT_ERR:
+            log(f"         Windows 错误码：{LAST_SENDINPUT_ERR}"
+                f"（5 = 拒绝访问 → 权限/安全软件；87 = 参数错误）")
         log("         最常见原因：**CS2 用管理员身份运行，本程序不是**（两边权限不一致）。")
         log("         修法：把本程序也「以管理员身份运行」一次，或者别用管理员启动 CS2。")
         log("         如果权限一致还是不灵，多半是安全软件拦了按键注入（加白名单试试）。")
@@ -5443,7 +5515,13 @@ class ConsoleTyper:
 
     # ---------------- 配置解析 ----------------
     def commands(self):
-        """把配置里的指令整理成"要发出去的字符串列表"。"""
+        """把配置里的指令整理成"要发出去的字符串列表"。
+
+        ★ 2026-10-09：顺便把"全角/不可见字符"洗干净（`sanitize_console_text`）——
+          用户从网页复制来的指令经常带不换行空格、全角引号，它们**看着和 ASCII 一样**，
+          旧版只会报一句"有字符没打出来"，用户完全不知道是哪个字符、怎么改。
+          现在自动换成 ASCII 等价物，并在日志里说明改了什么。
+        """
         raw = self.cfg.get("cs_console_commands") or []
         if isinstance(raw, str):
             raw = raw.replace("\r\n", "\n").split("\n")
@@ -5452,7 +5530,21 @@ class ConsoleTyper:
             s = str(line).strip()
             if not s or s.startswith("//") or s.startswith(";"):
                 continue                                  # 空行 / 注释
-            out.append(s)
+            clean, fixed = sanitize_console_text(s)
+            if fixed and len(out) + 1 <= 99:
+                # 只报前几条，避免刷屏；同一字符只提一次
+                seen = getattr(self, "_fixed_seen", None)
+                if seen is None:
+                    seen = self._fixed_seen = set()
+                new_bits = [f for f in fixed if f not in seen]
+                if new_bits:
+                    seen.update(new_bits)
+                    log(f"   ✏️ 第 {len(out) + 1} 条指令里发现打不出来的字符，已自动替换："
+                        f"{'，'.join(new_bits[:6])}"
+                        + ("…" if len(new_bits) > 6 else ""))
+                    log("      （多半是从网页/Word 复制来的：全角引号、不换行空格之类；"
+                        "以后填指令建议手打或从纯文本复制）")
+            out.append(clean)
         return out
 
     def enabled(self):
@@ -5519,9 +5611,16 @@ class ConsoleTyper:
                 # 每条指令都敲一次回车，控制台才会执行
                 self._tap_key(0x1C, False, tap_ms=30)
                 if bad:
-                    flag = f"  ⚠️ 打不出来的字符（已跳过）：{' '.join(bad)}"
+                    shown = " ".join(show_char(c) for c in bad[:8])
+                    flag = (f"  ⚠️ 打不出来的字符（已跳过）：{shown}"
+                            + ("…" if len(bad) > 8 else ""))
                 elif blocked:
-                    flag = "  ⚠️ 按键没送出去（SendInput 返回 0）"
+                    err = LAST_SENDINPUT_ERR
+                    why = {5: "拒绝访问（权限不够 / 被安全软件挡）",
+                           87: "参数错误"}.get(err, "")
+                    flag = (f"  ⚠️ 按键没送出去（SendInput 返回 0"
+                            + (f"，错误码 {err}{'：' + why if why else ''}" if err else "")
+                            + "）")
                     if not blocked_once:
                         blocked_once = True
                         self._warn_inject_blocked()
