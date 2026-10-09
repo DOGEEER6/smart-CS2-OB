@@ -4807,6 +4807,11 @@ ENGAGE_DIST = 1600.0
 DUEL_CLOSE_DIST = 1200.0    # 互相瞄且距离在这个以内 = 真交火（第 0 层）
 ENGAGE_NEAR_BONUS = 45      # 交火越近越紧急：0 距离 +45，到 DUEL_CLOSE_DIST 递减到 0
 STICKY_BONUS = 14           # 上一秒的第一名给一点加成，防止列表闪烁
+# ★ 2026-10-09：GSI 是 10Hz 的，"血量掉了"只在**中弹的那几包**里出现。
+#   如果只看"这一包掉没掉血"，一个正在对枪的人会在没中弹的那几包里丢掉第 0 层，
+#   镜头就会被人抢走、然后下几包又抢回来 —— 现场看就是"莫名其妙切走"。
+#   所以掉一次血就记一个时间戳，这么久之内都算"正在挨打"。
+DAMAGE_STICKY_S = 1.5
 NEAR_VERY_CLOSE = 500.0
 NEAR_CLOSE = 1000.0
 AIM_ANGLE_DEG = 22.0        # 朝向和"指向敌人"方向夹角小于这个值算"在瞄他"
@@ -5822,6 +5827,14 @@ class AutoSwitcher:
         top_tier = top.get("tier", 2)
         cur_tier = cur.get("tier", 2) if cur is not None else 2
         tier_up = (cur is None) or (top_tier < cur_tier)
+        # ★ 2026-10-09 加：**不许切到"层级更低"的人**。
+        #   以前只有"层级跃升"能绕过分数门槛，反方向没有护栏 —— 于是一个层级 2 的人
+        #   只要静态分叠得够多（残局 + 持包 + 刚击杀 + 道具在飞…），照样能把镜头从
+        #   正在对枪的人身上抢走，正好是用户反馈的"别人在对枪，镜头却切到架枪的人"。
+        #   层级是"他到底有没有在打"的判断，比分数硬：**正在打的人，镜头不离开他**。
+        if cur is not None and top_tier > cur_tier:
+            self.status = "保持当前（他在交火，别人分再高也不切）"
+            return
 
         need = float(self.cfg.get("auto_min_score", 45))
         if not tier_up and top.get("score", 0) < need:
@@ -5845,8 +5858,9 @@ class AutoSwitcher:
             self.switches += 1
             self.pending = {"sid": top["sid"], "key": key, "at": now}
             self.status = "切到 按[%s]（%s 分）" % (key, top.get("score"))
-            log("🎯 自动切换 → 按 [%s]  %s  分数 %s"
-                % (key, " · ".join(top.get("reasons") or []) or "—", top.get("score")))
+            log("🎯 自动切换 → 按 [%s]  %s  分数 %s · 第%s层"
+                % (key, " · ".join(top.get("reasons") or []) or "—", top.get("score"),
+                   top.get("tier", 2)))
         else:
             self.enabled = False
             self.status = "已关闭：发不出按键"
@@ -5878,6 +5892,7 @@ class AttentionModel:
 
     def __init__(self):
         self.prev = {}          # sid -> {"hp":..., "kills":...}
+        self.dmg_at = {}        # sid -> 最近一次"血量掉了"的时刻（见 DAMAGE_STICKY_S）
         self.kills = []         # 最近的击杀，用于手机上的播报
         self.last_top = None
         self.last_top_at = 0.0
@@ -5980,6 +5995,18 @@ class AttentionModel:
                 s += AW["taking_damage"]
                 took_damage = True
                 why.append(f"正在挨打 -{old['hp'] - pl['hp']}")
+            # ★ 2026-10-09 用户反馈："别人在对枪，镜头却切到另一个人，而那个人在架没有人的地方"。
+            #   两个原因都在"掉血"这个信号上：
+            #     ① GSI 是 10Hz 的，掉血只在**中弹的那几包**出现 → 对枪的人会在没中弹的
+            #        那几包里丢掉"正在挨打"，层级从 0 掉到 1，镜头就被别人抢走（来回跳）；
+            #     ② 流弹/火烧/摔伤也会让血量掉 → 一个根本没在打的人凭这个拿满"交火主导权"。
+            #   所以：掉血记一个"**最近挨过打**"的时间戳（1.5 秒内都算），并且**只有附近真
+            #   有敌人**时才把它当"真交火"（见下面的 strong_fight）。
+            if took_damage:
+                self.dmg_at[sid] = now
+            dmg_recent = (now - self.dmg_at.get(sid, 0.0)) < DAMAGE_STICKY_S
+            if dmg_recent and not took_damage:
+                why.append("刚挨打")
 
             # 找最近的敌人 + 朝向判定
             best_d = None
@@ -6023,16 +6050,23 @@ class AttentionModel:
                 s += AW["aiming_enemy"]; why.append(f"在瞄人 {int(best_d or 0)}")
 
             # ★★ 交火主导权 + 层级（排序时**层级优先于分数**）
-            #   0 = 真在打：正在挨打 / 互相瞄且距离很近   ← 任何静态信号都压不过
+            #   0 = 真在打：互相瞄（对枪） / 刚挨过打且附近有敌人   ← 任何静态信号都压不过
             #   1 = 对峙中：单向架枪，或远距离互相对望
             #   2 = 其他：按"叙事价值"排（持包/残局/包点…）
-            #   为什么要分距离：DUEL_MAX_DIST=1800 太宽，两个人隔着墙在 1800 单位外
-            #   对望也会拿满主导权，把真正的近距离对枪挤掉（实测：173 vs 172）。
+            #
+            # 2026-10-09 改（用户反馈"别人在对枪，镜头却切到架枪的人"）：
+            #   ① 掉血不再无条件算"真交火" —— 远距离流弹、火烧、摔伤都掉血，但它们
+            #      不代表在打。现在要求**附近（<1600 单位）真有敌人**才算第 0 层；
+            #   ② 互相瞄（对枪）的第 0 层距离从 1200 放宽到 1800（DUEL_MAX_DIST）——
+            #      以前 1200~1800 的中距离对枪只算第 1 层，会被一个"蹭到一下"的人
+            #      （第 0 层）挤掉。现在中距离对枪也是第 0 层，靠"越近越紧急"的加分
+            #      在两者之间排先后；**锁镜头**仍只在 1200 以内生效（隔墙对望焊不死）。
             engage_d = duel_dist if mutual else best_d
-            strong_fight = bool(took_damage) or (
-                mutual and engage_d is not None and engage_d < DUEL_CLOSE_DIST)
-            weak_fight = (not strong_fight) and aim_any and best_d is not None \
-                and best_d < ENGAGE_DIST
+            near_enemy = best_d is not None and best_d < ENGAGE_DIST
+            strong_fight = bool(
+                (mutual and engage_d is not None and engage_d < DUEL_MAX_DIST)
+                or (dmg_recent and near_enemy))
+            weak_fight = (not strong_fight) and aim_any and near_enemy
             engaging = bool(strong_fight or weak_fight)
             # 锁镜头只对"真对枪"（互相瞄且很近）生效。
             # 单纯"挨打"也算第 0 层（要排前面），但不锁 ——
