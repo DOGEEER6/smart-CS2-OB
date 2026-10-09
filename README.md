@@ -311,8 +311,11 @@ prob  = 1 / (1 + exp(−(powerA − powerB) / 22))
 
 **ffmpeg**：`winget install Gyan.FFmpeg`，或者从 [ffmpeg.org](https://ffmpeg.org/download.html)
 下 zip 后把 `bin` 加进 PATH —— **或者最省事：直接把 `ffmpeg.exe` 放到本程序目录旁边**
-（引擎会自己找到它，不用改 PATH；发给别人时也这么干）。没装 ffmpeg 时引擎会**明确拒绝**
-这个后端并让你改回插件后端（不会静默出洋相）。
+（引擎会自己找到它，不用改 PATH；发给别人时也这么干）。
+
+> 没有 ffmpeg 时引擎会**自动退回插件后端**接着用（你 OBS 里装了 Replay Source 的话），
+> 并在日志里说清原因 —— **回放不会因此整段失效**，也不会让你去手改 `config.json`。
+> 两个后端都用不了才会报"回放暂时不可用"（自动切镜头和手机提示器不受影响）。
 
 > **真机验证（OBS 32.x / 1080p60 / NVENC / 回放缓冲 20 秒）**：
 > 按 `←` 攒帧 → 按 `→` 裁 8 秒 → 播放 → 播完自动切回 → 留档，逐秒抽帧核对内容无误；

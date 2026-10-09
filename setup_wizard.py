@@ -33,7 +33,8 @@ sys.path.insert(0, HERE)
 try:
     from replay_director import (ObsClient, log, DEFAULTS, lan_ips,
                                  load_or_make_token, obs_log_newest,
-                                 obs_replay_buffer_info, find_ffmpeg)
+                                 obs_replay_buffer_info, find_ffmpeg,
+                                 obs_has_replay_source)
 except Exception as e:
     print(f"❌ 找不到 replay_director.py（应该在同一个目录里）：{e}")
     sys.exit(2)
@@ -503,7 +504,9 @@ class Wizard:
         except Exception:
             pass
 
-        has_plugin = "replay_source" in kinds
+        has_plugin = obs_has_replay_source(self.obs)
+        if not has_plugin and "replay_source" in (kinds or []):
+            has_plugin = True
         ff = find_ffmpeg(cfg)
         has_ff = bool(ff)
         info = obs_replay_buffer_info()

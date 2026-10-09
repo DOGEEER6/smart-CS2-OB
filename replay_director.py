@@ -502,6 +502,33 @@ def system_memory_gb():
         return (None, None)
 
 
+def obs_has_replay_source(obs):
+    """OBS 里到底有没有装 obs-replay-source 插件？
+
+    查两个地方（任意一个中就算有）：
+      * `GetInputKindList` 里有 `replay_source`（插件注册的源类型）；
+      * `GetInputList` 里的某个输入 `inputKind == "replay_source"`
+        （★ 2026-10-09 加：真机上 `GetInputKindList` 在个别版本会返回空/失败，
+         只看它会把"装了插件"误判成"没装" —— 于是向导自动切到 obs 后端，
+         而用户又没装 ffmpeg，回放就整段死了）。
+    """
+    try:
+        kinds = (obs.request("GetInputKindList", {"unversioned": False})
+                 or {}).get("inputKinds") or []
+        if "replay_source" in kinds:
+            return True
+    except Exception:
+        pass
+    try:
+        inputs = (obs.request("GetInputList") or {}).get("inputs") or []
+        for i in inputs:
+            if (i.get("inputKind") or "") == "replay_source":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def find_ffmpeg(cfg=None):
     """找一个可用的 ffmpeg（obs 后端裁片段用）。返回路径，找不到返回 ""。
 
@@ -1629,7 +1656,7 @@ class ObsBufferBackend:
             log("   ❌ obs 后端需要 ffmpeg 来裁片段（`-c copy` 零损失），但这台机器上没有。")
             log("      装一个：winget install Gyan.FFmpeg   或到 ffmpeg.org 下 zip 后把 bin 加进 PATH；")
             log("      也可以直接把 ffmpeg.exe 放到本程序目录旁边（最省事，不用改 PATH）。")
-            log("      想继续用回放：把 config.json 的 replay_backend 改回 \"plugin\"（默认）。")
+            log("      （如果 OBS 里装了 Replay Source 插件，引擎会自动退回插件后端接着用。）")
             return False
         self.ffmpeg = ff
         log(f"   ✅ ffmpeg: {ff}")
@@ -2060,6 +2087,25 @@ class ReplayDirector:
         self.counters = {"rounds": 0, "replays": 0, "skipped": 0, "interrupted": 0}
 
     # ---------------- 启动检查 ----------------
+    def _plugin_backend_available(self):
+        """插件后端能不能用：回放场景里有那个回放源，或者 OBS 里装了 `replay_source`。
+
+        用来在"选的后端不可用"时判断能不能自动退回插件后端（2026-10-09 真机反馈）。
+        """
+        if self.replay_item_id is not None:
+            return True
+        return obs_has_replay_source(self.obs)
+
+    def _obs_backend_available(self):
+        """obs 后端能不能用：有 ffmpeg + OBS 里启用了回放缓冲。"""
+        try:
+            if not find_ffmpeg(self.cfg):
+                return False
+            info = obs_replay_buffer_info()
+            return bool(info.get("enabled") is True and info.get("seconds"))
+        except Exception:
+            return False
+
     def preflight(self):
         cfg = self.cfg
         scenes, current = self.obs.scene_list()
@@ -2088,13 +2134,28 @@ class ReplayDirector:
                 f"{'可见' if it.get('sceneItemEnabled') else '隐藏'}){mark}")
         if self.backend_name == "obs":
             # obs 后端不用插件的回放源；它要的是回放场景里的**媒体源**
-            _ = self.backend.prepare()
-            self.obs_backend_ready = bool(_)
-            if not self.obs_backend_ready:
-                log("   ⚠️ obs 后端没准备好 —— 回放不可用；把 config.json 的 "
-                    "replay_backend 改回 \"plugin\" 可以继续用插件后端。")
+            ready = bool(self.backend.prepare())
+            if not ready and self._plugin_backend_available():
+                # ★ 2026-10-09 真机反馈（用户机器）：没装 ffmpeg → obs 后端直接拒绝启用 →
+                #   整个"回放功能"死了；可他机器上**插件是装着的**，明明能用。
+                #   所以这里自动退回插件后端，只改本次运行的配置（不偷偷改他的 config.json）。
+                log("   ↩ 自动退回「插件后端」：OBS 里有 Replay Source，回放照常能用。")
+                log("      想用 obs 后端的话：装好 ffmpeg（或把 ffmpeg.exe 放到本程序目录旁边），"
+                    "再到设置窗口 ① 页把「回放后端」切回 OBS 自带 Replay Buffer。")
+                self.backend_name = "plugin"
+                self.cfg["replay_backend"] = "plugin"
+                self.backend = None
+                self.obs_backend_ready = False
+            else:
+                self.obs_backend_ready = ready
+                if not ready:
+                    log("   ⚠️ obs 后端没准备好，而且插件后端也用不了 —— 回放暂时不可用"
+                        "（自动切镜头和手机提示器不受影响）。")
         elif self.replay_item_id is None:
             log(f"❌ 回放场景里找不到名为「{cfg['replay_item']}」的源，请核对名字。")
+            if self._obs_backend_available():
+                log("   ↩ 不过这台机器上 obs 后端的条件看着是齐的 —— 可以在设置窗口 ① 页"
+                    "把「回放后端」换成 OBS 自带 Replay Buffer（不需要那个插件）。")
             return False
 
         # 角标
@@ -2439,17 +2500,24 @@ class ReplayDirector:
         cfg = self.cfg
         if self.backend_name == "obs":
             # obs 后端：内存是**编码后**的，没有"未压缩帧翻倍"这些坑，报个简短结论就行
-            try:
-                mb = self.backend.memory_mb()
-            except Exception:
-                mb = 0.0
+            mbps = float(cfg.get("obs_buffer_mbps", 40.0) or 40.0)
+            secs = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+            mb = mbps * secs / 8.0 * 2.0
+            # ★ 2026-10-09：obs-websocket 读不到时长时（真机就是这样）要退回读 OBS 配置文件，
+            #   否则这里永远显示"(读不到)" —— 用户机器上明明设了 20 秒。
             buf = cfg.get("obs_buffer_seconds")
+            if not buf:
+                try:
+                    buf = obs_replay_buffer_info().get("seconds")
+                except Exception:
+                    buf = None
+                if buf:
+                    cfg["obs_buffer_seconds"] = buf
             log("")
             log("   🧠 内存体检（obs 后端：OBS 自带 Replay Buffer）")
-            log(f"      编码后缓冲 ≈ {mb:.0f} MB（按 {cfg.get('obs_buffer_mbps', 40)} Mbps × "
-                f"{float(cfg.get('record_max_seconds', 10.0)):.0f} 秒 × 2 份估）")
+            log(f"      编码后缓冲 ≈ {mb:.0f} MB（按 {mbps:.0f} Mbps × {secs:.0f} 秒 × 2 份估）")
             log(f"      OBS 回放缓冲时长：{'%.0f 秒' % float(buf) if buf else '(读不到)'}"
-                f"（必须 ≥ 单段上限 {float(cfg.get('record_max_seconds', 10.0)):.0f} 秒）")
+                f"（必须 ≥ 单段上限 {secs:.0f} 秒）")
             log("      ★ 这条路径**不需要**按未压缩帧那套限制时长：4K 也只是内存里放编码数据，")
             log("        片段是「保存缓冲文件 + ffmpeg 按 ←/→ 裁切」出来的（裁切零损失）。")
             log("")
