@@ -21,12 +21,15 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import webbrowser
 
 # ★ 必须是静态 import：PyInstaller 只认静态导入才会把它打进包里。
@@ -299,6 +302,9 @@ class DirectorGui:
         self.var_del_buf = tk.BooleanVar(
             value=bool(cfg.get("obs_delete_buffer_after_trim", True)))
         self.var_backend.trace_add("write", lambda *_: self._update_estimate())
+        # 自动切换这个开关最容易被"勾了不生效"坑到 —— 一变就推给正在跑的引擎
+        self.var_auto_switch.trace_add(
+            "write", lambda *_: self.sync_to_engine(quiet=True))
 
         # 秒数/模式一变就重算内存；端口一变就重算手机地址
         self.var_seconds.trace_add("write", lambda *_: self._update_estimate())
@@ -1134,12 +1140,81 @@ class DirectorGui:
             return False
         self.cfg = cfg
         self.append_log("配置已保存：" + self.cfg_path)
+        # ★ 保存后顺手推给正在跑的引擎（不然要重启引擎才生效 —— 用户踩过这个坑）
+        self.sync_to_engine(quiet=True)
         if notify:
             messagebox.showinfo("已保存", "配置已写入：\n%s" % self.cfg_path)
         return True
 
     def save_config_clicked(self):
         self.write_config(notify=True)
+
+    # ------------------------------------------------------------------
+    #  和"正在运行的引擎"同步（2026-10-09 加）
+    #  ★ 用户反馈："电脑 GUI 里勾了自动切换，但就是不切，好像和手机端不同步" ——
+    #    根因：窗口里改的只是 config.json，**跑着的引擎内存里还是旧值**，得重启引擎才生效；
+    #    而手机页面看到的是引擎的真实状态，于是"窗口里勾了、手机上还是关的"。
+    #    修法：窗口里一改就顺手调引擎那两个带口令的接口（手机用的就是它），立刻生效。
+    # ------------------------------------------------------------------
+    def _engine_web_port(self):
+        try:
+            return int(self.cfg.get("web_port", 23417) or 23417)
+        except Exception:
+            return 23417
+
+    def engine_online(self, timeout=1.0):
+        """正在跑的引擎在线吗？在线返回它的 /state（dict），不在返回 None。"""
+        port = self._engine_web_port()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/state",
+                                        timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", "replace") or "{}")
+        except Exception:
+            return None
+
+    def sync_to_engine(self, quiet=False):
+        """把窗口里的开关立刻推给正在运行的引擎。返回 True 表示真的推过去了。"""
+        st = self.engine_online()
+        if st is None:
+            if not quiet:
+                self.append_log("（引擎没在跑 —— 改动会在下次点「启动引擎」时生效）")
+            return False
+        port = self._engine_web_port()
+        tok = urllib.parse.quote(str(self.token or ""), safe="")
+        bk2val = {text: val for val, text in BACKEND_LABELS}
+        p2val = {text: val for val, text in PRESET_LABELS}
+        args = {
+            "on": "1" if self.var_auto_switch.get() else "0",
+            "preset": p2val.get(self.var_auto_preset.get(), "normal"),
+            "winbonus": "1" if self.var_win_bonus.get() else "0",
+            "names": "1" if self.var_show_names.get() else "0",
+        }
+        args2 = {
+            "replay": "1" if self.var_replay_enabled.get() else "0",
+            "mode": "armed" if self.var_mode.get() == MODE_ARMED else "buffer",
+        }
+        try:
+            q1 = urllib.parse.urlencode(args)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/auto?k={tok}&{q1}", timeout=2.0) as r:
+                r.read()
+            q2 = urllib.parse.urlencode(args2)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/feature?k={tok}&{q2}", timeout=2.0) as r:
+                r.read()
+        except Exception as e:
+            self.append_log("⚠ 同步到正在运行的引擎失败：%s" % e)
+            self.append_log("   （改动已经存进 config.json，重启引擎后一样生效）")
+            return False
+        self.append_log(
+            "✅ 已同步到正在运行的引擎：自动切换 %s · 灵敏度 %s · 胜率加成 %s · 显示名字 %s · "
+            "回放功能 %s · 内存模式 %s（手机页面会立刻跟着变）"
+            % ("开" if args["on"] == "1" else "关", args["preset"],
+               "开" if args["winbonus"] == "1" else "关",
+               "开" if args["names"] == "1" else "关",
+               "开" if args2["replay"] == "1" else "关",
+               "省内存" if args2["mode"] == "armed" else "常驻缓冲"))
+        return True
 
     # ------------------------------------------------------------------
     #  引擎子进程
@@ -1223,6 +1298,9 @@ class DirectorGui:
             return
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
         self._tick_status()
+        # 引擎要几秒才把网页服务拉起来 —— 起来之后把窗口里的开关同步过去，
+        # 保证"窗口上看到的 = 引擎正在做的"（不然会有"勾了不生效"的错觉）。
+        self.master.after(7000, lambda: self.sync_to_engine(quiet=True))
 
     def stop_engine(self):
         proc = self.proc

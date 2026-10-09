@@ -5339,21 +5339,26 @@ def send_key_scancode(sc, shift=False, tap_ms=14, extended=False):
 def type_text(text, per_char_ms=14):
     """把一段文本"打"进当前焦点窗口。
 
-    返回 `(ok, bad_chars)`：bad_chars 是这张表里没有的字符（原样跳过，不中断），
-    调用方会把它们打进日志 —— 免得"少打了一个符号"这种问题现场看不出来。
+    返回 `(ok, bad_chars, blocked)`：
+      * `bad_chars` —— 字符表里没有的字符（原样跳过、不中断）；
+      * `blocked`   —— **按键根本没送出去**（`SendInput` 返回 0）。
+
+    ★ 2026-10-09 用户反馈："发送控制台指令时每条都显示 `⚠️ 有字符没打出来：`，但后面什么也没有"。
+      原因就是这两种失败混成了一个 `ok=False`：字符都在表里（`bad` 是空的），
+      真正失败的是 `SendInput` 被系统/安全软件挡了（UIPI：目标窗口权限比我们高）。
+      现在分开报，并且给出最可能的原因 —— 不然用户只会看到一句空警告。
     """
     bad = []
-    ok = True
+    blocked = False
     for ch in text:
         ent = CHAR_SCANCODE.get(ch)
         if ent is None:
             bad.append(ch)
-            ok = False
             continue
         sc, shift = ent
         if not send_key_scancode(sc, shift, tap_ms=per_char_ms):
-            ok = False
-    return ok, bad
+            blocked = True
+    return (not bad and not blocked), bad, blocked
 
 
 def resolve_console_key(tok):
@@ -5419,9 +5424,22 @@ class ConsoleTyper:
         log(f"      [空跑] 按键 0x{sc:02X}{'（+Shift）' if shift else ''}")
         return True
 
+    def _warn_inject_blocked(self):
+        """按键注入被挡时，把"怎么修"一次说清（否则用户只看到一句空警告）。
+
+        2026-10-09 用户反馈"控制台指令每条都有个空警告 + 自动切换也不切" —— 同一个根因：
+        `SendInput` 返回 0，一个键都没送出去。最常见的是**权限不一致**：
+        CS2 以管理员身份运行、而本程序不是（Windows 的 UIPI 不允许低权限进程往高权限窗口注入），
+        其次是安全软件拦了输入注入。
+        """
+        log("      ⚠️ 按键被系统挡住了（SendInput 返回 0）—— 控制台指令和「自动切换」都会失效。")
+        log("         最常见原因：**CS2 用管理员身份运行，本程序不是**（两边权限不一致）。")
+        log("         修法：把本程序也「以管理员身份运行」一次，或者别用管理员启动 CS2。")
+        log("         如果权限一致还是不灵，多半是安全软件拦了按键注入（加白名单试试）。")
+
     def _dry_type(self, text, per_char_ms=14):
         log(f"      [空跑] 输入：{text}")
-        return True, []
+        return True, [], False
 
     # ---------------- 配置解析 ----------------
     def commands(self):
@@ -5493,11 +5511,22 @@ class ConsoleTyper:
             time.sleep(max(0.0, float(self.cfg.get("cs_console_delay_ms", 400)) / 1000.0))
 
             gap = max(0.0, float(self.cfg.get("cs_console_gap_ms", 120)) / 1000.0)
+            blocked_once = False
             for i, cmd in enumerate(cmds, 1):
-                ok, bad = self._type_text(cmd)
+                res = self._type_text(cmd)
+                ok, bad = res[0], res[1]
+                blocked = bool(res[2]) if len(res) > 2 else False
                 # 每条指令都敲一次回车，控制台才会执行
                 self._tap_key(0x1C, False, tap_ms=30)
-                flag = "" if ok else f"  ⚠️ 有字符没打出来：{' '.join(bad)}"
+                if bad:
+                    flag = f"  ⚠️ 打不出来的字符（已跳过）：{' '.join(bad)}"
+                elif blocked:
+                    flag = "  ⚠️ 按键没送出去（SendInput 返回 0）"
+                    if not blocked_once:
+                        blocked_once = True
+                        self._warn_inject_blocked()
+                else:
+                    flag = ""
                 log(f"      [{i}/{len(cmds)}] {cmd}{flag}")
                 time.sleep(gap)
             if self.cfg.get("cs_console_close", True):
@@ -5722,7 +5751,10 @@ class AutoSwitcher:
         else:
             self.enabled = False
             self.status = "已关闭：发不出按键"
-            log("❌ 自动切换：SendInput 发送失败，已关闭")
+            self.disabled_reason = "SendInput 发送失败（按键被系统挡住了）"
+            log("❌ 自动切换：SendInput 发送失败，已关闭。")
+            log("   最常见原因：**CS2 以管理员身份运行、本程序不是** —— 两边权限要一致")
+            log("   （把本程序也「以管理员身份运行」一次）；也可能是安全软件拦了按键注入。")
 
     def state(self):
         return {"enabled": self.enabled, "status": self.status,
