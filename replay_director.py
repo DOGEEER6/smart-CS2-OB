@@ -5802,8 +5802,12 @@ class AutoSwitcher:
             if exe != (self.cfg.get("auto_focus_exe", "cs2.exe") or "").lower():
                 self.status = f"暂停（前台是 {exe or '未知程序'}，不是 CS2）"
                 return
-        if now - self.last_switch < float(self.cfg.get("auto_min_dwell", 2.5)):
-            return
+
+        # ⚠️ 「最小停留」不能放在这里 —— 它是**防抖**用的，不该把"刚打起来"也挡住。
+        #    2026-10-09 用户反馈"经常错过交火、镜头一直给远处走路的人"：
+        #    镜头刚切到一个走路的人（第 2 层），1 秒后别处真打起来（第 0 层），
+        #    但停留时间没到（默认 3 秒）→ 直接 return → 这场交火整段错过。
+        #    所以停留检查挪到"算出新目标层级"之后，并且**真打起来可以立刻切**（见下）。
 
         pl = snap.get("players") or []
         if not pl:
@@ -5827,6 +5831,13 @@ class AutoSwitcher:
         top_tier = top.get("tier", 2)
         cur_tier = cur.get("tier", 2) if cur is not None else 2
         tier_up = (cur is None) or (top_tier < cur_tier)
+        # ★ 2026-10-09：**别处真打起来了** —— 镜头又不在交火上（当前是第 1/2 层）时，
+        #   不再受"最小停留"限制，立刻切过去。用户反馈的"回均错过两三个交火"
+        #   主要就是这么来的：停留计时还没到，交火已经打完了。
+        fight_started = (top_tier == 0 and cur_tier > 0)
+        dwell = float(self.cfg.get("auto_min_dwell", 2.5))
+        if not fight_started and now - self.last_switch < dwell:
+            return
         # ★ 2026-10-09 加：**不许切到"层级更低"的人**。
         #   以前只有"层级跃升"能绕过分数门槛，反方向没有护栏 —— 于是一个层级 2 的人
         #   只要静态分叠得够多（残局 + 持包 + 刚击杀 + 道具在飞…），照样能把镜头从
@@ -5893,6 +5904,7 @@ class AttentionModel:
     def __init__(self):
         self.prev = {}          # sid -> {"hp":..., "kills":...}
         self.dmg_at = {}        # sid -> 最近一次"血量掉了"的时刻（见 DAMAGE_STICKY_S）
+        self.pcache = {}        # sid -> 合并后的 allplayers 字段（部分包不会把人弄丢）
         self.kills = []         # 最近的击杀，用于手机上的播报
         self.last_top = None
         self.last_top_at = 0.0
@@ -5906,17 +5918,38 @@ class AttentionModel:
         mp = g.get("map") or {}
         bomb = g.get("bomb") or {}
 
-        players = {}
-        observed_sid = ((g.get("player") or {}).get("steamid") or "").strip() or None
+        # ★★ 2026-10-09：**必须先合并"部分包"**（和 MatchState._pcache 一个道理）。
+        #   CS2 隔几个包就发一次"只有 id/team"的包（见 §3.4），原来这里是直接读
+        #   `g["allplayers"]` 的，于是那些包里：
+        #     · 没有 state  → hp=None → 下面 `if pl["hp"] is None: continue` 把这个人
+        #       **整个从镜头候选里删掉** —— 正在对枪的人凭空消失；
+        #     · 没有 position/forward → 连"在瞄谁"都算不出来 → 判不出交火。
+        #   现场症状正是用户反馈的"**经常错过交火镜头，镜头一直给远处走路的人**"：
+        #   一半的包里对枪的人不存在，剩下的静态分最高的人（比如带包的/刚击杀的）就顶上来。
+        #   现在把上一包的字段留住 —— 位置最多旧 100ms，但人不会消失、交火判得出来。
+        cache = self.pcache
         for sid, p in allp.items():
             if not isinstance(p, dict):
                 continue
-            st = p.get("state") or {}
+            c = cache.setdefault(sid, {})
+            for k in ("state", "position", "forward", "weapons", "match_stats",
+                      "team", "name", "observer_slot"):
+                if p.get(k) is not None:
+                    c[k] = p[k]
+            c["seen"] = now
+        # 10 秒没出现的人（换图/断线）清掉，免得拿旧数据瞎判
+        for sid in [s for s, c in cache.items() if now - c.get("seen", 0) > 10]:
+            cache.pop(sid, None)
+
+        players = {}
+        observed_sid = ((g.get("player") or {}).get("steamid") or "").strip() or None
+        for sid, c in cache.items():
+            st = c.get("state") or {}
             hp = int(st.get("health") or 0) if "health" in st else None
-            pos = parse_vec(p.get("position"))
-            fwd = parse_vec(p.get("forward"))
+            pos = parse_vec(c.get("position"))
+            fwd = parse_vec(c.get("forward"))
             raw_ws = [(w.get("name"), (w.get("state") or ""))
-                      for w in (p.get("weapons") or {}).values()
+                      for w in (c.get("weapons") or {}).values()
                       if isinstance(w, dict) and w.get("name")]
             ws = [n for n, _ in raw_ws]
             # ★ 只认真正拿在手里的那把（state == "active"）。
@@ -5927,17 +5960,18 @@ class AttentionModel:
                 active = next((n for n in ws
                                if not n.startswith("weapon_knife") and n != "weapon_c4"),
                               ws[0])
-            slot = p.get("observer_slot")
+            slot = c.get("observer_slot")
             players[sid] = {
-                "sid": sid, "name": (p.get("name") or sid[:8]).strip(), "team": p.get("team") or "",
+                "sid": sid, "name": (c.get("name") or sid[:8]).strip(),
+                "team": c.get("team") or "",
                 "hp": hp, "pos": pos, "fwd": fwd, "weapons": ws, "active": active,
                 "slot": slot, "key": slot_key(slot),
                 "observed": (sid == observed_sid),
                 "kills": int(st.get("round_kills") or 0) if "round_kills" in st else None,
                 "r_dmg": int(st.get("round_totaldmg") or 0) if "round_totaldmg" in st else 0,
                 "armor": bool(st.get("armor")), "helmet": bool(st.get("helmet")),
-                "m_kills": (p.get("match_stats") or {}).get("kills"),
-                "m_deaths": (p.get("match_stats") or {}).get("deaths"),
+                "m_kills": (c.get("match_stats") or {}).get("kills"),
+                "m_deaths": (c.get("match_stats") or {}).get("deaths"),
                 "flashed": float(st.get("flashed") or 0) if "flashed" in st else 0.0,
                 "burning": bool(st.get("burning")), "money": st.get("money"),
                 "has_c4": any(w == "weapon_c4" for w in ws),
