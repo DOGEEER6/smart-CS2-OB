@@ -324,6 +324,8 @@ DEFAULTS = {
     # 裁完片段后要不要删掉 OBS 那份原始缓冲文件（OBS 每存一次就新写一个文件，
     # 不删的话磁盘会越攒越满：真机实测一次约 30 MB）。false = 留着原始文件。
     "obs_delete_buffer_after_trim": True,
+    # ffmpeg 的路径（留空 = 自动找：PATH / 程序目录旁边 / winget / scoop / chocolatey …）
+    "ffmpeg_exe": "",
 
     # --- 和 Astra 的协作（重要）---    # Astra 自己会按比赛阶段自动切场景（BP/直播/中场/图结束…）。为了不互相打架：
     #   require_live_scene : 只有当直播场景正好是 live_scene 时才插回放。
@@ -498,6 +500,57 @@ def system_memory_gb():
         return (st.ullTotalPhys / 1e9, st.ullAvailPhys / 1e9)
     except Exception:
         return (None, None)
+
+
+def find_ffmpeg(cfg=None):
+    """找一个可用的 ffmpeg（obs 后端裁片段用）。返回路径，找不到返回 ""。
+
+    查找顺序：配置里的 `ffmpeg_exe` → PATH → **程序目录旁边** → 常见安装位置。
+
+    ★ 为什么不能只认 PATH（2026-10-08 真机踩到）：`winget install Gyan.FFmpeg` 装完
+      PATH 往往要新开一个终端才生效；如果引擎是从旧终端/双击启动的，`shutil.which()`
+      找不到，obs 后端就会**直接拒绝启用**——用户明明装好了却被告知"没装 ffmpeg"。
+      所以多找几个常见位置，并且支持**把 ffmpeg.exe 直接丢在程序目录旁边**
+      （发给别人时最省事：解压出来把 ffmpeg.exe 放进去就行，不用改 PATH）。
+    """
+    cands = []
+    try:
+        c = str((cfg or {}).get("ffmpeg_exe") or "").strip()
+        if c:
+            cands.append(c)
+    except Exception:
+        pass
+    try:
+        w = shutil.which("ffmpeg")
+        if w:
+            cands.append(w)
+    except Exception:
+        pass
+    home = os.path.expanduser("~")
+    base = base_dir()
+    cands += [
+        os.path.join(base, "ffmpeg.exe"),
+        os.path.join(base, "bin", "ffmpeg.exe"),
+        os.path.join(base, "tools", "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(base, "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", "") or "", "Microsoft", "WinGet",
+                     "Links", "ffmpeg.exe"),
+        os.path.join(os.environ.get("ProgramFiles", "") or "", "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(os.environ.get("ProgramData", "") or "", "chocolatey", "bin",
+                     "ffmpeg.exe"),
+        os.path.join(home, "scoop", "shims", "ffmpeg.exe"),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+    ]
+    for c in cands:
+        try:
+            if c and os.path.isfile(c):
+                return c
+        except Exception:
+            continue
+    return ""
 
 
 def canvas_from_obs_config():
@@ -1571,10 +1624,11 @@ class ObsBufferBackend:
         """preflight：找/建媒体源，检查 ffmpeg 与 Replay Buffer 是否可用。"""
         cfg, obs = self.cfg, self.obs
         # 1) ffmpeg：裁切必需
-        ff = str(cfg.get("ffmpeg_exe") or "").strip() or shutil.which("ffmpeg")
-        if not ff or not os.path.exists(ff):
+        ff = find_ffmpeg(cfg)
+        if not ff:
             log("   ❌ obs 后端需要 ffmpeg 来裁片段（`-c copy` 零损失），但这台机器上没有。")
-            log("      装一个：winget install Gyan.FFmpeg   或到 ffmpeg.org 下 zip 后把 bin 加进 PATH")
+            log("      装一个：winget install Gyan.FFmpeg   或到 ffmpeg.org 下 zip 后把 bin 加进 PATH；")
+            log("      也可以直接把 ffmpeg.exe 放到本程序目录旁边（最省事，不用改 PATH）。")
             log("      想继续用回放：把 config.json 的 replay_backend 改回 \"plugin\"（默认）。")
             return False
         self.ffmpeg = ff
@@ -1648,10 +1702,20 @@ class ObsBufferBackend:
             log("   （读不到回放缓冲时长；请确认 OBS → 设置 → 输出 → 回放缓冲 里时长 ≥ "
                 f"{want:.0f} 秒）")
         if not obs.replay_buffer_active():
-            log("   （回放缓冲当前没在跑 —— 省内存模式下按入点键才会启动它）")
+            if str(cfg.get("replay_mode") or "armed").lower() == "armed":
+                log("   （回放缓冲当前没在跑 —— 省内存模式下按入点键才会启动它）")
+            else:
+                log("   （回放缓冲当前没在跑 —— 常驻缓冲模式马上会启动它）")
         self.ready = True
         log(f"   ✅ obs 后端就绪：内存 ≈ {self.memory_mb():.0f} MB"
             f"（按 {self.cfg.get('obs_buffer_mbps', 40)} Mbps 估；插件后端同条件是 GB 级）")
+        # ★ 真机教训（2026-10-08）：**常驻缓冲模式**下要把 OBS 的回放缓冲现在就开起来。
+        #   插件后端在 buffer 模式是 preflight 里 Enable 一次、插件自己一直攒；
+        #   obs 后端的对应动作就是 StartReplayBuffer —— 少了这一步，按 → 时
+        #   SaveReplayBuffer 会直接回 501，一整段素材白打（真机实测）。
+        if (str(cfg.get("replay_mode") or "armed").lower() != "armed"
+                and cfg.get("replay_enabled")):
+            self.arm("常驻缓冲模式（启动时就开）")
         return True
 
     # ---------------- 采集开关 ----------------
@@ -3197,17 +3261,20 @@ class ReplayDirector:
         return info
 
     def arm_capture(self, reason=""):
-        """省内存模式：让**当前后端**现在开始攒（插件 `Enable` / OBS `StartReplayBuffer`）。
+        """让**当前后端**现在开始攒（插件 `Enable` / OBS `StartReplayBuffer`）。
 
-        只有 armed 模式才这么干；buffer 模式本来就一直开着。
+        ⚠️ 插件后端只有 armed 模式才这么干（buffer 模式是 preflight 里一次性 Enable
+           之后插件自己一直攒）；**obs 后端两种模式都必须走 StartReplayBuffer** ——
+           真机踩过：buffer 模式下这里被 `replay_mode != "armed"` 挡掉，导致按 → 时
+           `SaveReplayBuffer` 直接报 501，一整段素材废掉。所以 obs 后端要在模式判断**之前**处理。
         """
-        if self.replay_mode != "armed":
-            return False
         if self.backend_name == "obs":
             if not self.obs_backend_ready:
                 return False
             self._capture_armed_at = time.time()
             return self.backend.arm(reason)
+        if self.replay_mode != "armed":
+            return False
         if self._capture_disabled is False:      # 已经在攒，不用重复 Enable
             return False
         try:
@@ -3293,7 +3360,9 @@ class ReplayDirector:
         if not on:
             if self.replay_active:
                 self._end_replay("回放功能已关闭")
-            if self.replay_mode == "armed":
+            # obs 后端：关回放就把 OBS 的回放缓冲停掉（几十~几百 MB，顺手还回去）；
+            # 插件后端仍然是"只有 armed 模式才需要显式 Disable"。
+            if self.replay_mode == "armed" or self.backend_name == "obs":
                 self.release_capture("回放功能已关闭")
             if self.cfg.get("clear_replay_on_disable", True):
                 self.clear_replays("回放功能已关闭")
@@ -3306,8 +3375,10 @@ class ReplayDirector:
                     self.release_capture("切到省内存模式")
                 log("🎛  回放功能 → 开启（省内存模式）：按【←】标入点的那一刻才开始攒帧。")
             else:
-                log("🎛  回放功能 → 开启（常驻缓冲模式）：插件一直攒着最近 "
-                    f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒。")
+                log("🎛  回放功能 → 开启（常驻缓冲模式）："
+                    + ("OBS 的回放缓冲一直开着，攒着最近 "
+                       if self.backend_name == "obs" else "插件一直攒着最近 ")
+                    + f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒。")
                 self.arm_capture("回放功能开启")
         if persist:
             self.persist_config()
@@ -3331,8 +3402,10 @@ class ReplayDirector:
             log("    ⚠️ 注意：这个模式下 ← 不能往回标了 —— 片段从你按 ← 那一刻开始。")
         else:
             self.arm_capture("切到常驻缓冲模式")
-            log("🧠 内存模式 → 常驻缓冲：插件一直攒着最近 "
-                f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒，"
+            log("🧠 内存模式 → 常驻缓冲："
+                + ("OBS 的回放缓冲一直开着，攒着最近 "
+                   if self.backend_name == "obs" else "插件一直攒着最近 ")
+                + f"{float(self.cfg.get('record_max_seconds', 10.0)):.0f} 秒，"
                 "← 可以标在已经过去的某一刻（代价是这份内存一直占着）。")
         self._log_memory()
         if persist:
@@ -6995,11 +7068,37 @@ def run_selftest(cfg=None):
 
     log("")
     if ok:
+        # ★ 2026-10-08：回放有**两个后端**，这里要按当前用的是哪个来说"还差什么"。
+        #   以前无条件写"要装 replay-source 插件" —— 用 obs 后端的人（不需要插件）
+        #   看了会以为少装东西，反过来插件后端的人又不知道 ffmpeg 是可选的。
+        backend = ""
+        try:
+            backend = str((cfg or {}).get("replay_backend") or "").lower()
+        except Exception:
+            backend = ""
         log("✅ 自检通过。还差的外部条件（这些不在这份程序里）：")
         log("   · OBS Studio 30+ 且开着 obs-websocket；")
-        log("   · exeldro/obs-replay-source 插件（回放功能靠它）；")
         log("   · CS2 装在**同一台**电脑上（GSI 只推到 127.0.0.1）；")
-        log("   · 首次设置向导跑过一次（会写 GSI 配置 + 放行防火墙）。")
+        log("   · 首次设置向导跑过一次（会写 GSI 配置 + 放行防火墙）；")
+        log("   · 回放功能要从下面两条里选一条（**自动切镜头和手机提示器都不需要**）：")
+        log("       ① 插件后端：装 exeldro/obs-replay-source 插件（内存 GB 级，但能任意入点定格/倒放）；")
+        log("       ② OBS 后端：本机有 ffmpeg + OBS 里启用「回放缓冲」（内存 MB 级，真机已验证）。")
+        if backend == "obs":
+            log("     当前配置用的是 ② OBS 后端 —— 所以**不需要**那个插件。")
+            ff = find_ffmpeg(cfg)
+            if ff:
+                log(f"     ✅ 本机 ffmpeg：{ff}")
+            else:
+                log("     ⚠️ 本机没找到 ffmpeg —— 装一个：winget install Gyan.FFmpeg"
+                    "（或者把 ffmpeg.exe 放到本程序目录旁边）")
+            info = obs_replay_buffer_info()
+            if info.get("enabled") is True and info.get("seconds"):
+                log(f"     ✅ OBS 回放缓冲已启用：{info['seconds']:.0f} 秒")
+            elif info.get("enabled") is False:
+                log("     ⚠️ OBS 里「回放缓冲」还没勾上（设置 → 输出 → 回放缓冲），勾完重启一次 OBS")
+        elif backend == "plugin":
+            log("     当前配置用的是 ① 插件后端 —— 记得装 exeldro/obs-replay-source。")
+            log("     （想不用插件：设置窗口 ① 页把「回放后端」换成 OBS 自带 Replay Buffer）")
     else:
         log("❌ 自检没通过 —— 先解决上面标 ❌ 的条目，否则连不上 OBS。")
     return 0 if ok else 3

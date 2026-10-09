@@ -7,7 +7,7 @@ CS2 导播副驾 —— 首次设置向导
   1. 找 CS2 安装目录
   2. 把 GSI 配置装进游戏
   3. 读 OBS 的 obs-websocket 密码（不用你手抄）
-  4. 检查 Replay Source 插件装没装
+  4. 检查回放能力（插件 / OBS 自带 Replay Buffer，二选一）
   5. 自动识别直播场景 / 创建回放场景
   6. 写好 config.json 并做一次端到端自检
 
@@ -32,7 +32,8 @@ sys.path.insert(0, HERE)
 
 try:
     from replay_director import (ObsClient, log, DEFAULTS, lan_ips,
-                                 load_or_make_token, obs_log_newest)
+                                 load_or_make_token, obs_log_newest,
+                                 obs_replay_buffer_info, find_ffmpeg)
 except Exception as e:
     print(f"❌ 找不到 replay_director.py（应该在同一个目录里）：{e}")
     sys.exit(2)
@@ -304,6 +305,14 @@ class Wizard:
         self.todo = []
         self.problems = []
         self.ok = []
+        # 第 4 步体检出来的回放后端（plugin / obs）—— 后面几步按它决定要不要碰插件
+        self.backend = str(cfg.get("replay_backend") or "plugin").lower()
+
+    @staticmethod
+    def backend_label(backend):
+        return ("OBS 自带 Replay Buffer（内存 MB 级，需要 ffmpeg）"
+                if backend == "obs" else
+                "obs-replay-source 插件（内存 GB 级，能任意入点定格/倒放）")
 
     # ---------------- 小工具 ----------------
     def say(self, s=""):
@@ -471,8 +480,12 @@ class Wizard:
                 self.did(("[演练] 会把端口/密码写进配置" if self.dry
                           else "已把端口/密码写进配置"))
 
-        # ---- 4. 连 OBS + 插件 ----
-        self.step(4, TOTAL, "连 OBS 并检查 Replay Source 插件")
+        # ---- 4. 连 OBS + 检查回放能力（两种后端二选一）----
+        # ★ 2026-10-08：回放有**两个后端**，这里要分别体检，不能只盯着插件：
+        #   ① 插件后端：装 exeldro/obs-replay-source（内存 GB 级，能任意入点定格/倒放）
+        #   ② OBS 后端：本机 ffmpeg + OBS 里启用「回放缓冲」（内存 MB 级）
+        #   自动切镜头和手机提示器**两个都不需要**。
+        self.step(4, TOTAL, "连 OBS 并检查回放能力（插件 / OBS 自带缓冲）")
         obs_exe = find_obs_exe()
         if obs_exe:
             self.good(f"OBS: {obs_exe}")
@@ -489,24 +502,59 @@ class Wizard:
                                       {"unversioned": False}) or {}).get("inputKinds") or []
         except Exception:
             pass
-        if "replay_source" in kinds:
-            self.good("Replay Source 插件已装 ✅")
+
+        has_plugin = "replay_source" in kinds
+        ff = find_ffmpeg(cfg)
+        has_ff = bool(ff)
+        info = obs_replay_buffer_info()
+        rb_sec = info.get("seconds")
+        rb_on = (info.get("enabled") is True)
+
+        if has_plugin:
+            self.good("Replay Source 插件已装 ✅ → 可以用「插件后端」")
         else:
-            self.bad("**Replay Source 插件没装**（OBS 里没有 replay_source 这个源类型）")
-            self.say("       下载: https://github.com/exeldro/obs-replay-source/releases")
-            self.say("       解压后把 obs-plugins 和 data 两个文件夹覆盖到 OBS 安装目录，重启 OBS")
-            self.todo.append("安装 Exeldro 的 obs-replay-source 插件")
-        self.say("   检查回放源与滤镜 ...")
-        try:
-            inputs = (self.obs.request("GetInputList") or {}).get("inputs") or []
-            rep = [i["inputName"] for i in inputs
-                   if (i.get("inputKind") or "") == "replay_source"]
-        except Exception:
-            rep = []
-        if rep:
-            self.good(f"已有回放源: {', '.join(rep)}")
+            self.say("   · 没装 Replay Source 插件 —— **不影响自动切镜头和手机提示器**，"
+                     "只影响「插件后端」的回放")
+            self.say("     想用插件后端：https://github.com/exeldro/obs-replay-source/releases"
+                     "（解压后覆盖到 OBS 安装目录，重启 OBS）")
+        if has_ff:
+            self.good(f"ffmpeg: {ff} → 可以用「OBS 自带 Replay Buffer」后端")
         else:
-            self.need("还没有 Replay Source 源 —— 下一步会自动创建")
+            self.say("   · 没找到 ffmpeg —— 「OBS 自带 Replay Buffer」后端需要它"
+                     "（winget install Gyan.FFmpeg，或下载 zip 把 bin 加进 PATH）")
+        if rb_on and rb_sec:
+            self.good(f"OBS 回放缓冲已启用：{rb_sec:.0f} 秒")
+        else:
+            self.say("   · OBS 里「回放缓冲」还没启用（设置 → 输出 → 回放缓冲 → 勾选，"
+                     "然后**重启一次 OBS**）")
+
+        # 只在"当前选的后端根本不可用"时自动换边，绝不擅自改动能用的配置
+        backend = str(cfg.get("replay_backend") or "plugin").lower()
+        obs_ready = bool(has_ff and rb_on)
+        if backend == "plugin" and not has_plugin and obs_ready:
+            cfg["replay_backend"] = "obs"
+            self.did("没装插件、但 ffmpeg + OBS 回放缓冲都就绪 → "
+                     "已自动把回放后端切到「OBS 自带 Replay Buffer」")
+            backend = "obs"
+        elif backend == "obs" and not obs_ready and has_plugin:
+            cfg["replay_backend"] = "plugin"
+            self.did("OBS 后端条件不齐（缺 ffmpeg 或没启用回放缓冲）→ "
+                     "已自动切回「插件后端」")
+            backend = "plugin"
+        self.backend = backend
+        if backend == "plugin" and not has_plugin:
+            self.bad("**当前选的是插件后端，但插件没装** —— 回放暂时用不了")
+            self.todo.append("装 exeldro/obs-replay-source 插件（或者把回放后端换成 OBS 自带的）")
+        elif backend == "obs" and not obs_ready:
+            self.bad("**当前选的是 OBS 后端，但条件不齐** —— 回放暂时用不了")
+            if not has_ff:
+                self.todo.append("装 ffmpeg（winget install Gyan.FFmpeg）")
+            if not rb_on:
+                self.todo.append("在 OBS 里启用「回放缓冲」并重启一次 OBS")
+        else:
+            self.good(f"回放后端可用：{self.backend_label(backend)}")
+            self.say("   （回放功能默认是关的，开播前在设置窗口里打开一次；"
+                     "自动切镜头和手机提示器不受影响）")
 
         # ---- 5. 场景 ----
         self.step(5, TOTAL, "识别直播场景 / 准备回放场景")
@@ -570,11 +618,15 @@ class Wizard:
                 except Exception as e:
                     self.bad(f"创建场景失败: {e}")
 
-        # 回放源
+        # 回放源（**只有插件后端才需要**；obs 后端要的是回放场景里那个媒体源，
+        # 缺了引擎启动时会自动建一个 ffmpeg_source）
         replay_item = cfg.get("replay_item") or "Replay Source"
-        if has_replay_scene and replay_item not in replay_caps:
+        if self.backend != "plugin":
+            self.say("   · 当前用的是 OBS 后端，不需要 Replay Source 源；"
+                     "回放场景里那个媒体源引擎会自动建/自动用。")
+        elif has_replay_scene and replay_item not in replay_caps:
             if "replay_source" not in kinds:
-                self.need(f"跳过创建回放源（插件没装）")
+                self.need("跳过创建回放源（插件没装）")
             elif self.dry:
                 self.did(f"[演练] 会在「{replay_scene}」里创建回放源「{replay_item}」")
             else:
@@ -596,7 +648,8 @@ class Wizard:
         #   (b) 老式：给采集源挂 replay_filter / replay_filter_audio 滤镜
         # 已经配好的**绝不动它**，只补缺失的。特别是：视频来源允许填场景名，
         # 回放就能带上 HUD 叠加层 —— 那是刻意的，不能被"修正"成裸采集源。
-        if live_scene and live_candidates and "replay_source" in kinds:
+        if (self.backend == "plugin" and live_scene and live_candidates
+                and "replay_source" in kinds):
             cap_name = next((c[0] for s2, c in live_candidates if s2 == live_scene),
                             live_candidates[0][1][0])
             valid = set(self.all_source_names()) | set(scenes)
@@ -638,30 +691,47 @@ class Wizard:
         cfg["replay_scene"] = replay_scene
         cfg["replay_item"] = replay_item
 
-        # ---- 6. 回放源参数 ----
-        self.step(6, TOTAL, "写回放源的参数")
-        want = {
-            "duration": int(round(float(cfg.get("record_max_seconds", 10.0)) * 1000)),
-            "speed_percent": round(float(cfg.get("speed", 0.7)) * 100 + 0.01, 2),
-            "visibility_action": 0 if self.cfg.get("replay_visibility_restart", True) else 2,
-            "end_action": 1,                 # Pause after single
-            "next_scene": cfg.get("live_scene") or "",
-        }
-        try:
-            _, cur = self.obs.input_settings(replay_item)
-            cur = cur or {}
-            patch = {k: v for k, v in want.items() if cur.get(k) != v}
-            if not patch:
-                self.good("参数已经是对的")
-            elif self.dry:
-                self.did(f"[演练] 会同步参数: {patch}")
-            else:
-                self.obs.request("SetInputSettings", {
-                    "inputName": replay_item, "inputSettings": patch,
-                    "overwrite": False})
-                self.did(f"已同步参数: {patch}")
-        except Exception as e:
+        # ---- 6. 回放参数 ----
+        if self.backend == "plugin":
+            self.step(6, TOTAL, "写回放源的参数（插件后端）")
+            want = {
+                "duration": int(round(float(cfg.get("record_max_seconds", 10.0)) * 1000)),
+                "speed_percent": round(float(cfg.get("speed", 0.7)) * 100 + 0.01, 2),
+                "visibility_action": 0 if self.cfg.get("replay_visibility_restart", True) else 2,
+                "end_action": 1,                 # Pause after single
+                "next_scene": cfg.get("live_scene") or "",
+            }
+            try:
+                _, cur = self.obs.input_settings(replay_item)
+                cur = cur or {}
+                patch = {k: v for k, v in want.items() if cur.get(k) != v}
+                if not patch:
+                    self.good("参数已经是对的")
+                elif self.dry:
+                    self.did(f"[演练] 会同步参数: {patch}")
+                else:
+                    self.obs.request("SetInputSettings", {
+                        "inputName": replay_item, "inputSettings": patch,
+                        "overwrite": False})
+                    self.did(f"已同步参数: {patch}")
+            except Exception as e:
                 self.need(f"写参数失败: {e}（引擎启动时也会自己同步一次）")
+        else:
+            # obs 后端：参数都在引擎里（媒体源 + OBS 自己的回放缓冲设置），这里只确认名字
+            self.step(6, TOTAL, "回放参数（OBS 后端）")
+            media_item = str(cfg.get("replay_media_item") or "回放媒体源")
+            cfg["replay_media_item"] = media_item
+            self.say(f"   · 回放场景里用的媒体源名：{media_item}"
+                     f"（缺了引擎启动时会自动建）")
+            if rb_sec:
+                want_sec = float(cfg.get("record_max_seconds", 10.0) or 10.0)
+                if rb_sec >= want_sec:
+                    self.good(f"OBS 回放缓冲时长 {rb_sec:.0f} 秒 ≥ 单段上限 {want_sec:.0f} 秒")
+                else:
+                    self.need(f"OBS 回放缓冲只有 {rb_sec:.0f} 秒 < 单段上限 {want_sec:.0f} 秒"
+                              f" —— 片段会被截短：OBS → 设置 → 输出 → 回放缓冲 里调大")
+            self.say("   · 裁片段用 ffmpeg 的 `-c copy`（零损失）；"
+                     "OBS 的关键帧间隔设 1 秒的话入点会更准")
 
         # ---- 7. 放行手机访问 ----
         self.step(7, TOTAL, "放行手机访问（Windows 防火墙）")
@@ -689,6 +759,8 @@ class Wizard:
 
     def self_test(self, replay_item, replay_scene, live_scene):
         obs = self.obs
+        if self.backend != "plugin":
+            return self.self_test_obs(replay_scene, live_scene)
         # a) 回放源能不能被认出来
         try:
             items = self.scene_items(replay_scene)
@@ -755,6 +827,54 @@ class Wizard:
                 self.need("OBS 里没有 ReplaySource.Replay 热键（重启 OBS 后会注册）")
         except Exception as e:
             self.need(f"热键检查失败: {e}")
+
+    def self_test_obs(self, replay_scene, live_scene):
+        """obs 后端的端到端自检：只查它真正依赖的东西（场景 / 媒体源 / ffmpeg / 回放缓冲）。"""
+        obs = self.obs
+        cfg = self.cfg
+        # a) 回放场景 + 媒体源（媒体源缺了引擎会自动建，所以缺也不算错）
+        media_item = str(cfg.get("replay_media_item") or "回放媒体源")
+        try:
+            names = [i["sourceName"] for i in self.scene_items(replay_scene)]
+            if media_item in names:
+                self.good(f"「{replay_scene}」里能找到媒体源「{media_item}」")
+            else:
+                self.say(f"   ℹ️  「{replay_scene}」里还没有媒体源「{media_item}」——"
+                         f"引擎启动时会自动建一个（ffmpeg_source）")
+        except Exception as e:
+            self.need(f"检查回放场景失败: {e}")
+        # b) ffmpeg
+        ff = find_ffmpeg(cfg)
+        if ff:
+            self.good(f"ffmpeg 就绪：{ff}")
+        else:
+            self.bad("没找到 ffmpeg —— obs 后端裁不了片段")
+            self.say("       装一个：winget install Gyan.FFmpeg，"
+                     "或者把 ffmpeg.exe 放到本程序目录旁边")
+        # c) OBS 回放缓冲
+        info = obs_replay_buffer_info()
+        if info.get("enabled") is True and info.get("seconds"):
+            self.good(f"OBS 回放缓冲已启用：{info['seconds']:.0f} 秒")
+        elif info.get("enabled") is False:
+            self.bad("OBS 里「回放缓冲」没启用 —— 按入点键时会被 OBS 拒绝")
+            self.say("       OBS → 设置 → 输出 → 回放缓冲 → 勾选，然后**重启一次 OBS**")
+        else:
+            self.need("读不到 OBS 回放缓冲设置 —— 请到 OBS → 设置 → 输出 → 回放缓冲 确认已勾选")
+        # d) 场景
+        try:
+            sl = obs.request("GetSceneList") or {}
+            names = [s["sceneName"] for s in (sl.get("scenes") or [])]
+            if live_scene in names:
+                self.good(f"直播场景「{live_scene}」存在")
+            else:
+                self.bad(f"直播场景「{live_scene}」不存在")
+            if obs.scene_list()[1] != live_scene:
+                self.say(f"   ℹ️  当前节目场景是「{obs.scene_list()[1]}」，不是「{live_scene}」"
+                         f" —— 开播前切过去即可")
+            else:
+                self.good("当前就在直播场景上")
+        except Exception as e:
+            self.need(f"场景检查失败: {e}")
 
     def summary(self):
         self.say()

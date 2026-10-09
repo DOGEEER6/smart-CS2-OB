@@ -304,12 +304,24 @@ prob  = 1 / (1 + exp(−(powerA − powerB) / 22))
 **在哪切**：设置窗口 → ① 回放与按键 → 「回放后端」。
 
 **OBS 后端的一次性配置**：设置 → 输出 → **回放缓冲** → 勾选启用，
-「最长回放时间」设成 ≥ 你的单段上限（比如 20 秒），编码器选 NVENC、码率给足（40 Mbps 起）；
+「最长回放时间」设成 **单段上限的 2 倍**（要 10 秒就设 20 秒 —— 原因见下面那条实测规律），
+编码器选 NVENC、码率给足（40 Mbps 起）；
 **勾完请重启一次 OBS**（这个输出是 OBS 启动时创建的；不重启就按 `←` 会看到
 `Replay buffer is not available`）。关键帧间隔设 1 秒的话，裁出来的入点会更准。
 
-> 2026-10-08 已在真机（OBS 32.x / 1080p60 / NVENC / 回放缓冲 20 秒）走完整流程：
-> 按 `←` 攒帧 → 按 `→` 裁 8 秒 → 播放 → 播完自动切回 → 留档，逐秒抽帧核对内容无误。
+**ffmpeg**：`winget install Gyan.FFmpeg`，或者从 [ffmpeg.org](https://ffmpeg.org/download.html)
+下 zip 后把 `bin` 加进 PATH —— **或者最省事：直接把 `ffmpeg.exe` 放到本程序目录旁边**
+（引擎会自己找到它，不用改 PATH；发给别人时也这么干）。没装 ffmpeg 时引擎会**明确拒绝**
+这个后端并让你改回插件后端（不会静默出洋相）。
+
+> **真机验证（OBS 32.x / 1080p60 / NVENC / 回放缓冲 20 秒）**：
+> 按 `←` 攒帧 → 按 `→` 裁 8 秒 → 播放 → 播完自动切回 → 留档，逐秒抽帧核对内容无误；
+> `trim_mode=exact` 也验过：入点对齐到**完全相同的帧**（原始文件 t=8.0s 与片段首帧都是 `SEC 42`）。
+>
+> ⚠️ **实测规律：OBS 实际留住的比设置值略少**（设 20 秒 → 存出来 16.6~19.1 秒，
+> 它按关键帧粒度丢最老的包）——所以时长要设成单段上限的 2 倍。
+> 引擎不猜数字：一律按**文件真实时长**报数、按真实时长算播放长度。
+>
 > 引擎还会体检：读不到 OBS 的缓冲时长就直接读 OBS 配置文件；小于单段上限会警告；
 > 裁完**自动删掉** OBS 那份原始文件（它每存一次就新写一个，一场比赛能攒几个 GB），
 > 录像目录里始终只剩当前这一段的 `_clip.mp4`。
@@ -538,7 +550,7 @@ f1..f24 / a..z / 0..9 / backslash / comma / period / slash / semicolon / quote /
 | 游戏 | CS2（**必须和 OBS 在同一台电脑上** —— GSI 只往 `127.0.0.1` 推） |
 | OBS | OBS Studio 30+，开启 **obs-websocket**（OBS 28+ 已内置） |
 | 回放插件（可选） | [exeldro/obs-replay-source](https://github.com/exeldro/obs-replay-source) —— **只有"插件后端"回放需要**；自动切换 + 手机提示器不需要 |
-| ffmpeg（可选） | **只有"OBS 自带 Replay Buffer"后端需要**（裁片段用），`winget install Gyan.FFmpeg` |
+| ffmpeg（可选） | **只有"OBS 自带 Replay Buffer"后端需要**（裁片段用）：`winget install Gyan.FFmpeg`，**或者把 `ffmpeg.exe` 放到本程序目录旁边**（引擎会自动找到） |
 | Python | 3.9+（用成品 exe 的话**不需要**） |
 | 依赖 | 只有 `websocket-client`，其余全标准库；**成品 exe 里已经打包好了** |
 | 图形设置窗口 | Python 自带 `tkinter`（官方安装包默认有；成品 exe 里也打进去了） |

@@ -95,9 +95,11 @@ KEY_MODE_LABELS = (
     ("poll", "轮询（不经过输入管线，物理上不会拖住键盘）"),
 )
 # 回放后端（内存 vs 兼容性）
+# ★ 2026-10-08：把"要不要装插件"写进标签里 —— 用户看到向导/自检里提插件会以为必须装，
+#   其实只有插件后端需要它。
 BACKEND_LABELS = (
-    ("plugin", "插件 obs-replay-source（默认，GB 级内存）"),
-    ("obs", "OBS 自带 Replay Buffer（几十~几百 MB，需 ffmpeg）"),
+    ("plugin", "插件 obs-replay-source（要装插件，GB 级内存）"),
+    ("obs", "OBS 自带 Replay Buffer（不用插件，几十~几百 MB，需 ffmpeg）"),
 )
 
 # 第一次用（旁边还没有 config.json）时顶在按键区上方的那句提醒
@@ -454,19 +456,20 @@ class DirectorGui:
                      values=[v for _, v in BACKEND_LABELS]).grid(
             row=row, column=1, columnspan=3, sticky="w", pady=(8, 2))
         row += 1
-        ttk.Label(f, text="obs 后端：媒体源名").grid(row=row, column=0, sticky="w",
-                                             padx=8, pady=2)
-        ttk.Entry(f, textvariable=self.var_media_item, width=22).grid(
-            row=row, column=1, sticky="w", pady=2)
+        self.lbl_media_item = ttk.Label(f, text="obs 后端：媒体源名")
+        self.lbl_media_item.grid(row=row, column=0, sticky="w", padx=8, pady=2)
+        self.ent_media_item = ttk.Entry(f, textvariable=self.var_media_item, width=22)
+        self.ent_media_item.grid(row=row, column=1, sticky="w", pady=2)
         ttk.Label(f, text="（回放场景里那个媒体源；缺了引擎会自动建）",
                   font=SMALL_FONT, foreground="#666666").grid(
             row=row, column=2, columnspan=2, sticky="w", padx=(4, 8), pady=2)
         row += 1
-        tk.Checkbutton(f, text="obs 后端：裁完自动删掉 OBS 那份原始缓冲文件（省磁盘，"
-                               "一场比赛能省几个 GB）",
-                       variable=self.var_del_buf, wraplength=760, justify="left",
-                       anchor="w", highlightthickness=0).grid(
-            row=row, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 0))
+        self.chk_del_buf = tk.Checkbutton(
+            f, text="obs 后端：裁完自动删掉 OBS 那份原始缓冲文件（省磁盘，"
+                    "一场比赛能省几个 GB）",
+            variable=self.var_del_buf, wraplength=760, justify="left",
+            anchor="w", highlightthickness=0)
+        self.chk_del_buf.grid(row=row, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 0))
         row += 1
         ttk.Label(f, text="插件后端＝内存放未压缩帧（1080p60 十秒两份 ≈ 9.95 GB，能瞬间定格/任意入点）；"
                           "obs 后端＝OBS 自带 Replay Buffer（编码后 ≈ 几十~几百 MB，"
@@ -550,9 +553,20 @@ class DirectorGui:
         pairs = (("直播场景", self.var_live_scene),
                  ("回放场景", self.var_replay_scene),
                  ("回放源名称", self.var_replay_item))
+        self.ent_replay_item = None
         for i, (text, var) in enumerate(pairs):
             ttk.Label(f, text=text, width=14).grid(row=i, column=0, sticky="w", padx=8, pady=3)
-            ttk.Entry(f, textvariable=var).grid(row=i, column=1, sticky="ew", padx=(4, 8), pady=3)
+            ent = ttk.Entry(f, textvariable=var)
+            ent.grid(row=i, column=1, sticky="ew", padx=(4, 8), pady=3)
+            if text == "回放源名称":
+                self.ent_replay_item = ent
+        # ★ 2026-10-08："回放源名称"只有**插件后端**才用得上，选 obs 后端时标出来，
+        #   免得用户以为必须装那个插件、或者以为这个框没填就不能回放。
+        self.lbl_replay_item_hint = ttk.Label(
+            f, text="", font=SMALL_FONT, foreground="#666666", wraplength=760,
+            justify="left")
+        self.lbl_replay_item_hint.grid(row=len(pairs), column=0, columnspan=2,
+                                       sticky="w", padx=8, pady=(2, 6))
 
     # ---- 3.4b 副驾提示器 / 自动切换 / 存盘（= 手机页面上那些开关，2026-10-07 补齐）----
     def _build_companion(self, root):
@@ -817,6 +831,44 @@ class DirectorGui:
     # ------------------------------------------------------------------
     #  内存估算（规格 §3.2）
     # ------------------------------------------------------------------
+    def _refresh_backend_hint(self, is_obs):
+        """按当前回放后端，把"用不上的字段"标出来（2026-10-08）。
+
+        为什么：用户看到向导/自检里提 Replay Source 插件，会以为**必须**装插件。
+        实际上只有插件后端需要它 —— 所以选 obs 后端时把「回放源名称」标注成用不上，
+        选插件后端时把 obs 专用的两个控件置灰。
+        """
+        try:
+            if is_obs:
+                if getattr(self, "lbl_replay_item_hint", None) is not None:
+                    self.lbl_replay_item_hint.configure(
+                        text="↑「回放源名称」只有**插件后端**才用得上：当前是 obs 后端，"
+                             "回放场景里要的是一个**媒体源**（见上一页「obs 后端：媒体源名」），"
+                             "缺了引擎会自动建。")
+                if getattr(self, "ent_replay_item", None) is not None:
+                    self.ent_replay_item.configure(state="disabled")
+            else:
+                if getattr(self, "lbl_replay_item_hint", None) is not None:
+                    self.lbl_replay_item_hint.configure(
+                        text="↑ 插件后端需要 OBS 里装了 exeldro/obs-replay-source 插件，"
+                             "并且回放场景里有一个同名的「Replay Source」源"
+                             "（想不装插件：把「回放后端」换成 OBS 自带 Replay Buffer）。")
+                if getattr(self, "ent_replay_item", None) is not None:
+                    self.ent_replay_item.configure(state="normal")
+            for name in ("lbl_media_item", "ent_media_item", "chk_del_buf"):
+                wdg = getattr(self, name, None)
+                if wdg is None:
+                    continue
+                try:
+                    if name.startswith("ent_"):
+                        wdg.configure(state="disabled" if not is_obs else "normal")
+                    else:
+                        wdg.configure(foreground="#9aa4ae" if not is_obs else "")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _update_estimate(self, *_):
         """实时内存估算 + 内存护栏判断。
 
@@ -832,6 +884,7 @@ class DirectorGui:
             is_obs = bk2val.get(self.var_backend.get(), "plugin") == "obs"
         except Exception:
             is_obs = False
+        self._refresh_backend_hint(is_obs)
         raw = str(self.var_seconds.get()).strip().replace("，", ".")
         try:
             seconds = float(raw)
