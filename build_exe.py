@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把导播工具打包成双击就能用的成品。
+"""把导播工具打包成双击就能用的成品（**开箱即用：连 ffmpeg 一起带上**）。
 
     python build_exe.py                 # 默认：文件夹版（推荐，最稳）+ 自动打 zip
     python build_exe.py --no-zip        # 不打 zip
+    python build_exe.py --no-ffmpeg     # 不带 ffmpeg（体积小 30 MB 左右）
     python build_exe.py --mode onefile  # 单文件版（拷来拷去方便）
     python build_exe.py --clean         # 先清干净再打包
 
 产物：
   文件夹版   CS2导播助手\\开始导播.exe      （旁边还有 _internal\\ 和 先运行我-首次设置.cmd）
+             CS2导播助手\\ffmpeg.exe         （★ 自带的 ffmpeg，obs 后端开箱即用）
              CS2导播助手.zip                （同目录下，方便发给别人 / 传 Release 附件）
-  单文件版   开始导播.exe                   （就一个文件）
+  单文件版   开始导播.exe                   （就一个文件；ffmpeg 要自己另外放旁边）
 
 双击「开始导播.exe」= 图形设置窗口（2026-10-07 起）；窗口里点「启动引擎」才开始导播。
 命令行用法完全不变：`开始导播.exe --engine` 直接跑引擎（6-director.cmd 走的就是这条）。
@@ -22,6 +24,12 @@
 
 「首次设置」不是单独的 exe，而是同一个程序的 `--setup`：
   开始导播.exe --setup
+
+★ 为什么要把 ffmpeg 一起打包（2026-10-09 用户要求"所有依赖打包好、开箱即用"）：
+  "OBS 自带 Replay Buffer" 这个后端（内存只占几十~一百多 MB）裁片段要用 ffmpeg，
+  而让用户自己去 winget/官网下载、解压、配 PATH 是**最容易卡住的一步**。
+  现在打包时自动把 ffmpeg.exe 复制到成品文件夹（跟 exe 同级），引擎会自己找到它，
+  用户什么都不用装。想不带就加 `--no-ffmpeg`。
 """
 import os
 import shutil
@@ -67,7 +75,7 @@ echo.
 echo  这个向导会自动帮你：
 echo    1. 找到 CS2 并把 GSI 配置装进游戏
 echo    2. 读出 OBS 的 obs-websocket 密码（不用手抄）
-echo    3. 检查 Replay Source 插件
+echo    3. 检查回放能力（插件 / OBS 自带 Replay Buffer，二选一；两个都不用装也能用自动切镜头）
 echo    4. 识别直播场景、准备好回放场景和参数
 echo    5. 放行手机访问（会弹一次 UAC 授权框，点"是"）
 echo.
@@ -87,7 +95,11 @@ pause
 
 
 # 跟着成品一起发出去的说明/工具
-EXTRAS = ["使用说明.md", "8-allow-phone.cmd", "导播流程卡.md"]
+EXTRAS = ["新手教程.md", "使用说明.md", "导播流程卡.md", "README.md",
+          "8-allow-phone.cmd"]
+
+# ffmpeg 相关：要找的候选位置（按优先级），以及随包要带的许可证说明
+FFMPEG_LICENSE_FILES = ["docs/ffmpeg-说明.txt", "docs/ffmpeg-LICENSE.txt"]
 
 
 def preflight_deps():
@@ -188,6 +200,60 @@ def copy_extras(dest_dir):
                 print(f"  （{name} 没拷过去：{e}）")
 
 
+def find_ffmpeg_to_bundle():
+    """找一份可以跟着成品发出去的 ffmpeg.exe（找不到返回 ""）。
+
+    顺序：仓库根目录 → tools/ffmpeg/bin → PATH → 常见安装位置。
+    之所以先看仓库根目录：把 ffmpeg.exe 丢在这里最省事（`--no-ffmpeg` 可以不带）。
+    """
+    cands = [
+        os.path.join(HERE, "ffmpeg.exe"),
+        os.path.join(HERE, "tools", "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(HERE, "ffmpeg", "bin", "ffmpeg.exe"),
+    ]
+    try:
+        w = shutil.which("ffmpeg")
+        if w:
+            cands.append(w)
+    except Exception:
+        pass
+    for c in cands:
+        try:
+            if c and os.path.isfile(c):
+                return c
+        except Exception:
+            continue
+    return ""
+
+
+def bundle_ffmpeg(dest_dir):
+    """把 ffmpeg.exe 和它的许可证说明拷进成品目录（开箱即用的关键一步）。"""
+    src = find_ffmpeg_to_bundle()
+    if not src:
+        print("  ⚠️  没找到 ffmpeg.exe —— 这次不带。")
+        print("      （想带就把它放到仓库根目录，或先 winget install Gyan.FFmpeg 再打包；")
+        print("        不带也能用：用户自己装 ffmpeg，或改用插件后端。）")
+        return None
+    dst = os.path.join(dest_dir, "ffmpeg.exe")
+    if os.path.realpath(src) != os.path.realpath(dst):
+        try:
+            shutil.copy2(src, dst)
+        except Exception as e:
+            print(f"  ❌ 拷 ffmpeg 失败：{e}")
+            return None
+    mb = os.path.getsize(dst) / 1024 / 1024
+    print(f"  ✅ 已带上 ffmpeg：ffmpeg.exe（{mb:.1f} MB，源：{src}）")
+    for rel in FFMPEG_LICENSE_FILES:
+        s = os.path.join(HERE, rel)
+        if os.path.isfile(s):
+            try:
+                shutil.copy2(s, os.path.join(dest_dir, os.path.basename(rel)))
+            except Exception as e:
+                print(f"  （{rel} 没拷过去：{e}）")
+    print("     → 用户什么都不用装：引擎会在程序目录旁边找到它（obs 后端开箱即用）")
+    return dst
+
+
 def run(cmd):
     print("  $ " + " ".join(cmd))
     return subprocess.run(cmd, cwd=HERE)
@@ -223,7 +289,7 @@ def _rmtree_or_die(path, what):
         raise SystemExit(2)
 
 
-def build_onedir():
+def build_onedir(want_ffmpeg=True):
     """打成一个自包含的文件夹，直接落在项目目录里。"""
     out = os.path.join(HERE, FOLDER_NAME)
     _rmtree_or_die(out, "成品文件夹")
@@ -248,13 +314,16 @@ def build_onedir():
               encoding="utf-8-sig", newline="\r\n") as f:
         f.write(FIRST_RUN_CMD)
     copy_extras(out)
+    if want_ffmpeg:
+        print("自带依赖（不装任何东西就能用「OBS 自带 Replay Buffer」后端）：")
+        bundle_ffmpeg(out)
 
     size = sum(os.path.getsize(os.path.join(dp, fn))
                for dp, _, fns in os.walk(out) for fn in fns) / 1024 / 1024
     return (out, dst_exe, size), 0
 
 
-def build_onefile():
+def build_onefile(want_ffmpeg=True):
     out = os.path.join(HERE, ONEFILE_NAME)
     r = run(pyinstaller_args("onefile", DIST))
     if r.returncode != 0:
@@ -269,6 +338,11 @@ def build_onefile():
     with open(cmd_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
         f.write(FIRST_RUN_CMD)
     copy_extras(HERE)
+    if want_ffmpeg:
+        # 单文件版没法把 ffmpeg 塞进 exe（PyInstaller 只解压到临时目录，
+        # 引擎找的是"exe 旁边"），所以就直接放在 exe 旁边 —— 一样是开箱即用。
+        print("自带依赖（ffmpeg 放在 exe 旁边）：")
+        bundle_ffmpeg(HERE)
     return (out, out, size), 0
 
 
@@ -276,6 +350,7 @@ def main():
     argv = sys.argv[1:]
     mode = "onedir"
     want_zip = "--no-zip" not in argv
+    want_ffmpeg = "--no-ffmpeg" not in argv
     if "--mode" in argv:
         mode = argv[argv.index("--mode") + 1]
     if "--onefile" in argv:
@@ -309,7 +384,8 @@ def main():
     print("=" * 66)
     print(f"打包（{mode} 版）—— 引擎 + 图形设置窗口 + 首次设置都在同一个程序里")
     print("=" * 66)
-    built, rc = (build_onedir() if mode == "onedir" else build_onefile())
+    built, rc = (build_onedir(want_ffmpeg) if mode == "onedir"
+                 else build_onefile(want_ffmpeg))
     if rc != 0:
         print(f"❌ 打包失败（退出码 {rc}）")
         return rc
@@ -328,13 +404,17 @@ def main():
         print("打 zip（发给别人 / 传 Release 附件用）：")
         zip_path = make_zip(out, os.path.join(HERE, FOLDER_NAME + ".zip"))
 
+    ff_bundled = (mode == "onedir" and os.path.isfile(os.path.join(out, "ffmpeg.exe"))) or \
+                 (mode == "onefile" and os.path.isfile(os.path.join(HERE, "ffmpeg.exe")))
+
     print()
     print("=" * 66)
     print(f"✅ 打包完成，用了 {time.time() - t0:.0f} 秒")
     print("=" * 66)
     if mode == "onedir":
         print(f"  成品文件夹: {out}")
-        print(f"  整个文件夹: {size:.1f} MB")
+        print(f"  整个文件夹: {size:.1f} MB"
+              + ("（含自带的 ffmpeg）" if ff_bundled else ""))
         print(f"  双击这个  : {exe}")
         if zip_path:
             print(f"  发给别人用: {zip_path}"
@@ -344,6 +424,12 @@ def main():
         print("  之后每次：双击「开始导播.exe」打开设置窗口，点「启动引擎」开始导播")
         print("            （不想开窗口就跑命令行：开始导播.exe --engine）")
         print()
+        if ff_bundled:
+            print("  ★ 开箱即用：文件夹里已经带了 ffmpeg.exe，对方**不需要装任何东西**")
+            print("    （包括「OBS 自带 Replay Buffer」这个省内存后端需要的 ffmpeg）。")
+        else:
+            print("  ⚠️ 这次**没有**带 ffmpeg（加了 --no-ffmpeg，或打包机上找不到它）：")
+            print("     用「OBS 自带 Replay Buffer」后端的人要自己装 ffmpeg，或改用插件后端。")
         print("  注意：整个文件夹一起拷走才能用（别只拷 exe）。不想打 zip 加 --no-zip。")
     else:
         print(f"  成品: {out}   {size:.1f} MB")
@@ -352,6 +438,8 @@ def main():
         print("  之后每次：双击「开始导播.exe」打开设置窗口，点「启动引擎」开始导播")
         print()
         print("  单文件版拷到任何 Windows 电脑都能跑，不需要装 Python。")
+        if ff_bundled:
+            print("  ★ ffmpeg.exe 就在这个 exe 旁边 —— 一起拷走，省内存的 obs 后端才能用。")
         print("  如果它报 “Could not create temporary directory”，")
         print("  说明这台电脑的 %TEMP% 被限制/被杀软拦了，改用文件夹版即可。")
     print()

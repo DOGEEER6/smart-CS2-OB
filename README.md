@@ -27,12 +27,42 @@
 
 ---
 
+## 🚀 开箱即用（第一次用就照这一段做）
+
+**包里带齐了所有依赖**：Python、`websocket-client`、图形界面、**连 ffmpeg 都在里面**（省内存的那个
+OBS 后端要用它裁片段）。所以对方电脑上**什么都不用装** —— 不装 Python、不装 ffmpeg、不装插件。
+
+### 详细的图文步骤看这里 → **[新手教程.md](新手教程.md)**
+
+（压缩包里也放了这一份，解压就能看到；下面只是最精简的四步。）
+
+```
+① 解压 CS2导播助手.zip  →  得到 CS2导播助手\ 文件夹（整个文件夹一起用，别只拷 exe）
+② OBS 里勾一次：设置 → 输出 → 回放缓冲 → 启用 + 最长回放时间 20 秒 → 重启 OBS
+③ 双击「先运行我-首次设置.cmd」→ UAC 点「是」→ 看到 "🎉 全部就绪！"
+④ 双击「开始导播.exe」→ 设置窗口里：勾「回放功能」、回放后端选「OBS 自带 Replay Buffer」、
+   按需改键/开自动切换 → 点「启动引擎」→ 手机打开日志里那行地址
+```
+
+| 你想要 | 在哪设 |
+|---|---|
+| **画面自动跟着交火走** | 设置窗口「② 副驾 / 存盘」勾「自动切换观察位」（或手机页面下方那个大按钮） |
+| **回放只占几十 MB 内存** | 设置窗口「① 回放与按键」→ 回放后端选 **OBS 自带 Replay Buffer**（需要上面第 ② 步） |
+| **一台机器什么都不想装** | 就这样用 —— ffmpeg 已经在文件夹里了（`ffmpeg.exe`，和 `开始导播.exe` 同级） |
+
+> 打包的人注意：`python build_exe.py` 会自动把仓库根目录的 `ffmpeg.exe`（或 PATH 里的）
+> 复制进成品文件夹再打 zip，所以发出去的包才是真正开箱即用；不想要就加 `--no-ffmpeg`。
+> 随包的 ffmpeg 是第三方程序（GPLv3），许可证和来源说明在 `docs/ffmpeg-说明.txt` +
+> `docs/ffmpeg-LICENSE.txt`，会一起放进包里。
+
+---
+
 ## 30 秒上手
 
 ### 拿到的是成品（推荐，不需要装 Python）
 
-> 拿到 **`CS2导播助手.zip`**（约 12 MB）就先解压；拿到的是整个 `CS2导播助手\` 文件夹就直接用
-> （**别只拷 exe**，`_internal\` 必须一起）。
+> 拿到 **`CS2导播助手.zip`**（约 45 MB，**自带 ffmpeg**）就先解压；
+> 拿到的是整个 `CS2导播助手\` 文件夹就直接用（**别只拷 exe**，`_internal\` 必须一起）。
 
 ```bat
 :: 1. 先打开 OBS（不用开播）
@@ -72,6 +102,7 @@ python replay_director.py --no-gui    :: 不开窗口，直接命令行跑引擎
 pip install pyinstaller websocket-client
 python build_exe.py --clean
 :: 产物：CS2导播助手\  和  CS2导播助手.zip（直接当 GitHub Release 附件）
+::      默认会把 ffmpeg 一起打包进去（开箱即用）；不想带就加 --no-ffmpeg
 ```
 
 > 默认打**文件夹版**（onedir）。单文件版（`--mode onefile`）每次启动都要解压到 `%TEMP%`，
@@ -553,7 +584,7 @@ f1..f24 / a..z / 0..9 / backslash / comma / period / slash / semicolon / quote /
 | 游戏 | CS2（**必须和 OBS 在同一台电脑上** —— GSI 只往 `127.0.0.1` 推） |
 | OBS | OBS Studio 30+，开启 **obs-websocket**（OBS 28+ 已内置） |
 | 回放插件（可选） | [exeldro/obs-replay-source](https://github.com/exeldro/obs-replay-source) —— **只有"插件后端"回放需要**；自动切换 + 手机提示器不需要 |
-| ffmpeg（可选） | **只有"OBS 自带 Replay Buffer"后端需要**（裁片段用）：`winget install Gyan.FFmpeg`，**或者把 `ffmpeg.exe` 放到本程序目录旁边**（引擎会自动找到） |
+| ffmpeg | **已随包提供**（`ffmpeg.exe` 就在 `开始导播.exe` 旁边，不用装）。从源码跑又没装的话：`winget install Gyan.FFmpeg`，或把 ffmpeg.exe 放到程序目录旁边 |
 | Python | 3.9+（用成品 exe 的话**不需要**） |
 | 依赖 | 只有 `websocket-client`，其余全标准库；**成品 exe 里已经打包好了** |
 | 图形设置窗口 | Python 自带 `tkinter`（官方安装包默认有；成品 exe 里也打进去了） |
@@ -561,13 +592,16 @@ f1..f24 / a..z / 0..9 / backslash / comma / period / slash / semicolon / quote /
 
 ### 把成品拷给别人时，对方需要准备什么
 
-**程序本身拷过去就能跑**（`CS2导播助手\` 整个文件夹，含 `_internal\`），不需要 Python、不需要 `pip install`。
+**程序本身拷过去就能跑**（`CS2导播助手\` 整个文件夹，含 `_internal\` 和随包的 `ffmpeg.exe`），
+不需要 Python、不需要 `pip install`、**也不需要装 ffmpeg**。
 但下面这些**不在这个文件夹里**，得对方机器上本来就有：
 
 1. **OBS Studio 30+**，并且开着 obs-websocket（OBS 28+ 内置，在「工具 → WebSocket 服务器设置」里启用）；
 2. **CS2**，装在**同一台**电脑上（GSI 配置由向导写进游戏的 `game\csgo\cfg\`；换机器要重跑向导）；
-3. **想用回放**：装 [obs-replay-source](https://github.com/exeldro/obs-replay-source) 插件，
-   或者改用「OBS 自带 Replay Buffer」后端（那就装 ffmpeg + 在 OBS 里勾一次回放缓冲）。
+3. **要回放的话**，二选一（都不用额外下载）：
+   - **OBS 自带 Replay Buffer**（推荐，内存几十~一百多 MB）：OBS 里勾一次「回放缓冲」（见
+     [新手教程](新手教程.md) 第 3 步），ffmpeg 包里已经带了；
+   - **插件后端**（内存 GB 级）：自己去装 [obs-replay-source](https://github.com/exeldro/obs-replay-source)。
    **只用「手机提示器 + 自动切换镜头」的话，上面两样都不需要。**
 
 然后**跑一次「首次设置向导」**（双击 `先运行我-首次设置.cmd`，或在设置窗口里点「首次设置向导」）。
