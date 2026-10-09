@@ -4,7 +4,7 @@
 > 最新的放最上面。tag 名沿用仓库既有约定：`smart-CS2-OB-v版本.日期`
 > （历史：`smart-CS2-OB-v1.0`、`smart-CS2-OB-v1.0.261006`）。
 >
-> **附件**：`python build_exe.py` 现在会在出包的同时自动打一个 **`CS2导播助手.zip`**（约 12 MB），
+> **附件**：`python build_exe.py` 现在会在出包的同时自动打一个 **`CS2导播助手.zip`**（自带 ffmpeg，约 49 MB；加 `--no-ffmpeg` 则约 12 MB），
 > 直接把它作为 Release 附件上传即可（文件夹版本身不适合进 git，已被 `.gitignore` 排除）。
 >
 > **正文里想插界面截图**：用仓库里的绝对地址，例如
@@ -75,7 +75,7 @@
 **现在**：`python build_exe.py` 会把 ffmpeg **一起打包进去**：
 
 - 成品文件夹里多一个 `ffmpeg.exe`（和 `开始导播.exe` 同级），引擎自己会找它（`find_ffmpeg()`）；
-- zip 从约 12 MB 变成约 45 MB —— 对方解压完**什么都不用装**：不装 Python、不装 ffmpeg、不装插件；
+- zip 从约 12 MB 变成约 49 MB —— 对方解压完**什么都不用装**：不装 Python、不装 ffmpeg、不装插件；
 - 随包带上第三方许可证与来源说明（`ffmpeg-说明.txt` + `ffmpeg-LICENSE.txt`，GPLv3）；
 - 不想要就 `python build_exe.py --no-ffmpeg`（回到 12 MB，用户需要自己装 ffmpeg）。
 
